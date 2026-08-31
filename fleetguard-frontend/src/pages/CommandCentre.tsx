@@ -272,7 +272,13 @@ export default function CommandCentrePage() {
           />
           <CardBody>
             {isSingleCustomer ? (
-              componentExposure.isPending || !componentExposure.data ? (
+              componentExposure.isError ? (
+                <ErrorState
+                  error={componentExposure.error}
+                  onRetry={() => void componentExposure.refetch()}
+                  compact
+                />
+              ) : componentExposure.isPending || !componentExposure.data ? (
                 <SkeletonCard height="h-56" className="border-0 p-0" />
               ) : (
                 <ExposureBars

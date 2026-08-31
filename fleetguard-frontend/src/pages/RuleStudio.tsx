@@ -233,6 +233,8 @@ function StepBar({
               type="button"
               disabled={!reachable}
               onClick={() => onStep(entry.id)}
+              aria-current={state === "current" ? "step" : undefined}
+              title={reachable ? undefined : "Choose a component first"}
               className={cn(
                 "flex w-full items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-left transition-colors",
                 state === "current"
@@ -360,6 +362,7 @@ function ComponentPicker({
                       key={part.part_code}
                       type="button"
                       onClick={() => onSelect(part.part_code)}
+                      aria-pressed={selected === part.part_code}
                       className={cn(
                         "rounded-card border p-3.5 text-left transition-colors",
                         selected === part.part_code
@@ -783,7 +786,9 @@ function DeployStep({
           }
         />
         <CardBody>
-          {preview.isPending || !preview.data ? (
+          {preview.isError ? (
+            <ErrorState error={preview.error} onRetry={() => void preview.refetch()} compact />
+          ) : preview.isPending || !preview.data ? (
             <SkeletonText lines={4} />
           ) : (
             <>

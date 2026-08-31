@@ -607,6 +607,7 @@ export default function FleetPage() {
               type="button"
               title={view.hint}
               onClick={() => applySavedView(view)}
+              aria-pressed={activeSavedView?.id === view.id}
               className={cn(
                 "rounded-full border px-2.5 py-0.5 text-[0.75rem] transition-colors",
                 activeSavedView?.id === view.id

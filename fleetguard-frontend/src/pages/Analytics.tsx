@@ -167,7 +167,9 @@ export default function AnalyticsPage() {
             description="Twelve months per component, on one shared scale. The tallest panel is the component costing the most workshop time."
           />
           <CardBody>
-            {trends.isPending || !trends.data ? (
+            {trends.isError ? (
+              <ErrorState error={trends.error} onRetry={() => void trends.refetch()} compact />
+            ) : trends.isPending || !trends.data ? (
               <SkeletonCard height="h-64" className="border-0 p-0" />
             ) : trends.data.by_component.length === 0 ? (
               <EmptyState
@@ -188,7 +190,9 @@ export default function AnalyticsPage() {
             description="How much of the fleet's risk each telematics signal carries, averaged across every deployed rule."
           />
           <CardBody>
-            {trends.isPending || !trends.data ? (
+            {trends.isError ? (
+              <ErrorState error={trends.error} onRetry={() => void trends.refetch()} compact />
+            ) : trends.isPending || !trends.data ? (
               <SkeletonCard height="h-64" className="border-0 p-0" />
             ) : (
               <SignalWeightBars signals={trends.data.signal_prevalence} height={300} />
@@ -261,7 +265,7 @@ function ComponentTrendGrid({
   const peak = Math.max(...panels.flatMap((panel) => panel.series.map((row) => row.failures)), 1);
 
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1 2xl:grid-cols-2">
       {panels.map((panel) => (
         <div key={panel.code} className="rounded-card border border-hairline px-3 pb-1 pt-2.5">
           <div className="flex items-baseline justify-between gap-2">

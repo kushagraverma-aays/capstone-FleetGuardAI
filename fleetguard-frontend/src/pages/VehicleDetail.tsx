@@ -197,7 +197,13 @@ export default function VehicleDetailPage() {
                 description="Ten weeks of scoring for this component, against the 70% red threshold."
               />
               <CardBody>
-                {prediction.isPending || !prediction.data ? (
+                {prediction.isError ? (
+                  <ErrorState
+                    error={prediction.error}
+                    onRetry={() => void prediction.refetch()}
+                    compact
+                  />
+                ) : prediction.isPending || !prediction.data ? (
                   <SkeletonCard height="h-48" className="border-0 p-0" />
                 ) : (
                   <ProbabilityTrend points={prediction.data.trend} />
@@ -211,7 +217,13 @@ export default function VehicleDetailPage() {
                 description="Each signal's share of this component's stress term, from the deployed rule."
               />
               <CardBody>
-                {prediction.isPending || !prediction.data ? (
+                {prediction.isError ? (
+                  <ErrorState
+                    error={prediction.error}
+                    onRetry={() => void prediction.refetch()}
+                    compact
+                  />
+                ) : prediction.isPending || !prediction.data ? (
                   <SkeletonCard height="h-48" className="border-0 p-0" />
                 ) : (
                   <SignalDrivers drivers={prediction.data.drivers} />

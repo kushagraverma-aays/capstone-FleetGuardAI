@@ -47,7 +47,7 @@ export function RiskBadge({
       <span className={cn("h-1.5 w-1.5 rounded-full", style.dot)} aria-hidden="true" />
       {style.label}
       {escalated ? (
-        <AlertTriangle className="h-3 w-3" aria-label="Escalated on remaining life" />
+        <AlertTriangle className="h-3 w-3" role="img" aria-label="Escalated on remaining life" />
       ) : null}
     </span>
   );

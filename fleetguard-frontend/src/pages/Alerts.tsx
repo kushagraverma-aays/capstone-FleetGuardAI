@@ -190,6 +190,7 @@ export default function AlertsPage() {
               key={entry.value}
               type="button"
               onClick={() => setParam({ status: entry.value })}
+              aria-pressed={status === entry.value}
               className={cn(
                 "rounded-full border px-2.5 py-1 text-[0.75rem] transition-colors",
                 status === entry.value
