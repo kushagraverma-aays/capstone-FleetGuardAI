@@ -27,6 +27,9 @@ interface DrawerProps {
   subtitle?: ReactNode;
   /** Actions pinned to the bottom of the panel. */
   footer?: ReactNode;
+  /** A control beside the close button - "start a new conversation", and
+   *  anything else that belongs to the panel rather than to its content. */
+  headerAction?: ReactNode;
   children: ReactNode;
   width?: "md" | "lg" | "xl";
 }
@@ -43,6 +46,7 @@ export function Drawer({
   title,
   subtitle,
   footer,
+  headerAction,
   children,
   width = "lg",
 }: DrawerProps) {
@@ -129,7 +133,10 @@ export function Drawer({
                   <p className="mt-0.5 truncate text-[0.8125rem] text-muted">{subtitle}</p>
                 ) : null}
               </div>
-              <IconButton icon={X} label="Close panel" onClick={onClose} />
+              <div className="flex shrink-0 items-center gap-1">
+                {headerAction}
+                <IconButton icon={X} label="Close panel" onClick={onClose} />
+              </div>
             </header>
 
             <div className="scroll-thin flex-1 overflow-y-auto px-6 py-5">{children}</div>
