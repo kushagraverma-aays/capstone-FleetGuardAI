@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -17,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.db import ping
+from app.routers import auth, export, fleet, insights, rules, workflow
 from app.logging_config import configure_logging, get_logger, new_request_id, request_id_var
 
 configure_logging()
@@ -25,6 +26,19 @@ log = get_logger("fleetguard.api")
 
 class UpstreamLLMError(RuntimeError):
     """Raised when the LLM provider fails. Surfaces as 502 with its message."""
+
+
+# A stable machine-readable slug per status, so a client can branch on the
+# error without string-matching a human sentence that may be reworded.
+ERROR_SLUGS = {
+    400: "bad_request",
+    401: "unauthenticated",
+    403: "forbidden",
+    404: "not_found",
+    409: "conflict",
+    422: "invalid_request",
+    429: "rate_limited",
+}
 
 
 def create_app() -> FastAPI:
@@ -100,6 +114,20 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.exception_handler(HTTPException)
+    async def http_handler(request: Request, exc: HTTPException):
+        # Same envelope as every other error, so the frontend needs exactly one
+        # parser rather than one for FastAPI's default shape and one for ours.
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": ERROR_SLUGS.get(exc.status_code, "request_failed"),
+                "message": exc.detail if isinstance(exc.detail, str) else "Request failed.",
+                "request_id": request_id_var.get(),
+            },
+            headers=exc.headers,
+        )
+
     @app.exception_handler(UpstreamLLMError)
     async def llm_handler(request: Request, exc: UpstreamLLMError):
         log.error("llm_upstream_failure", extra={"detail": str(exc)})
@@ -137,6 +165,16 @@ def create_app() -> FastAPI:
                 "request_id": request_id_var.get(),
             },
         )
+
+    # Routers hold no business logic: they read parameters, call a service and
+    # shape the response. Order is presentational - it is the order the tags
+    # appear in /docs, which is part of the demo.
+    app.include_router(auth.router)
+    app.include_router(insights.router)
+    app.include_router(fleet.router)
+    app.include_router(rules.router)
+    app.include_router(workflow.router)
+    app.include_router(export.router)
 
     @app.get("/api/health", tags=["system"], summary="Liveness probe")
     def health() -> dict:
