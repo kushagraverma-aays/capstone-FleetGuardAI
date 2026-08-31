@@ -372,3 +372,17 @@ class RulDetail(ApiModel):
     failure_threshold_index: float
     curve: list[CurvePoint]
     cross_check: str
+
+
+class FilterOptions(ApiModel):
+    """Every value the fleet filters can offer, within the caller's scope.
+
+    A customer-scoped caller sees only the models and regions present in its
+    own fleet - the filter menu must not leak the existence of another
+    tenant's depots or vehicle variants.
+    """
+
+    models: list[str]
+    variants: list[str]
+    regions: list[str]
+    vehicle_statuses: list[str]

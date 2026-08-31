@@ -58,6 +58,12 @@ interface DataTableProps<T> {
   empty?: ReactNode;
   /** Turn on for long lists. `height` then bounds the scroll container. */
   virtualized?: boolean;
+  /**
+   * Width the columns need to stay readable, e.g. "72rem". Below it the table
+   * scrolls sideways instead of crushing every column - a fleet table that
+   * squeezes "Transmission Fluid" into 4rem has stopped being a table.
+   */
+  minWidth?: string;
   height?: number;
   rowHeight?: number;
   className?: string;
@@ -77,6 +83,7 @@ export function DataTable<T>({
   loading = false,
   empty,
   virtualized = false,
+  minWidth,
   height = 620,
   rowHeight = 52,
   className,
@@ -124,7 +131,7 @@ export function DataTable<T>({
     <div
       role="row"
       className="grid items-center gap-4 border-b border-hairline bg-canvas/70 px-4 backdrop-blur"
-      style={{ gridTemplateColumns: template, height: "2.5rem" }}
+      style={{ gridTemplateColumns: template, height: "2.5rem", minWidth }}
     >
       {visible.map((column) => {
         const sorted =
@@ -182,7 +189,7 @@ export function DataTable<T>({
       <div
         key={id}
         role="row"
-        style={{ gridTemplateColumns: template, height: rowHeight, ...style }}
+        style={{ gridTemplateColumns: template, height: rowHeight, minWidth, ...style }}
         tabIndex={interactive ? 0 : -1}
         onClick={interactive ? () => onRowClick?.(row) : undefined}
         onKeyDown={
@@ -221,7 +228,7 @@ export function DataTable<T>({
   if (rows.length === 0) {
     return (
       <div className={cn("overflow-hidden rounded-card border border-hairline bg-surface", className)}>
-        {header}
+        <div className="scroll-thin overflow-x-auto">{header}</div>
         {empty}
       </div>
     );
@@ -234,26 +241,32 @@ export function DataTable<T>({
       aria-rowcount={rows.length}
       className={cn("overflow-hidden rounded-card border border-hairline bg-surface", className)}
     >
-      <div role="rowgroup" className="sticky top-0 z-10">
-        {header}
-      </div>
-
       {virtualized ? (
+        // One scroll container for both axes, so the header scrolls sideways
+        // with the body and stays put vertically.
         <div ref={scrollRef} className="scroll-thin overflow-auto" style={{ height }}>
+          <div role="rowgroup" className="sticky top-0 z-10">
+            {header}
+          </div>
           <div role="rowgroup" style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
             {virtualizer.getVirtualItems().map((item) =>
               renderRow(rows[item.index], {
                 position: "absolute",
                 top: 0,
                 left: 0,
-                right: 0,
                 transform: `translateY(${item.start}px)`,
+                width: "100%",
               }),
             )}
           </div>
         </div>
       ) : (
-        <div role="rowgroup">{rows.map((row) => renderRow(row))}</div>
+        <div className="scroll-thin overflow-x-auto">
+          <div role="rowgroup" className="sticky top-0 z-10">
+            {header}
+          </div>
+          <div role="rowgroup">{rows.map((row) => renderRow(row))}</div>
+        </div>
       )}
     </div>
   );

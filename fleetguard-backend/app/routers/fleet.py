@@ -17,6 +17,7 @@ from app.models import Prediction, Rule
 from app.schemas.common import Page
 from app.schemas.fleet import (
     CustomerOut,
+    FilterOptions,
     PredictionDetail,
     PredictionOut,
     RulBands,
@@ -79,6 +80,15 @@ def _filters(
 )
 def list_customers(db: DbSession, scope: CurrentScope) -> list[CustomerOut]:
     return [CustomerOut(**row) for row in fleet_queries.list_customers(db, scope)]
+
+
+@router.get(
+    "/filter-options",
+    response_model=FilterOptions,
+    summary="Distinct models, variants, regions and statuses in this scope",
+)
+def get_filter_options(db: DbSession, scope: CurrentScope) -> FilterOptions:
+    return FilterOptions(**fleet_queries.filter_options(db, scope))
 
 
 # --- predictions -------------------------------------------------------------

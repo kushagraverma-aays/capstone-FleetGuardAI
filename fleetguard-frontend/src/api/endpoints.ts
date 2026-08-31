@@ -16,6 +16,7 @@ import type {
   DraftRequest,
   DraftResponse,
   FailureTrends,
+  FilterOptions,
   FleetComparison,
   NotificationAudience,
   NotificationOut,
@@ -123,6 +124,8 @@ const asQuery = (filters: object | undefined): QueryParams =>
 export const getScopeInfo = () => request<ScopeInfo>("/api/auth/me");
 
 export const listCustomers = () => request<CustomerOut[]>("/api/customers");
+
+export const getFilterOptions = () => request<FilterOptions>("/api/filter-options");
 
 // --- command centre ----------------------------------------------------------
 

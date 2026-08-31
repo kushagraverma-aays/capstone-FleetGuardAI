@@ -222,13 +222,24 @@ def current_km_on_part(
     Every job-card type installs a fresh part - a fitment is the first fit, a
     failure is replaced on the spot, a preventive swap is planned - so the most
     recent event of any type is the part's zero point.
+
+    **Events dated after today are ignored.** A job card in the future has not
+    happened yet, and counting it resets the part's clock to zero while the
+    prediction - scored from telemetry that stops at the last observed week -
+    still reports the component as worn out. The vehicle drawer then reads
+    "0 km of 90,000" beside "Overdue", which is precisely the contradiction
+    the cross-check sentence exists to rule out.
     """
     vehicle = vehicle or session.get(Vehicle, vin)
     if vehicle is None:
         return 0.0
     install_odometer = session.execute(
         select(JobCard.odometer_reading)
-        .where(JobCard.vin == vin, JobCard.part_code == part_code)
+        .where(
+            JobCard.vin == vin,
+            JobCard.part_code == part_code,
+            JobCard.event_date <= date.today(),
+        )
         .order_by(JobCard.event_date.desc(), JobCard.job_card_id.desc())
         .limit(1)
     ).scalars().first()
@@ -499,10 +510,15 @@ def vehicle_components(session: Session, vin: str) -> list[dict]:
 
 
 def vehicle_service_history(session: Session, vin: str, limit: int = 200) -> list[dict]:
+    """The workshop timeline for one vehicle, most recent first.
+
+    Bounded to today for the same reason as `current_km_on_part`: a service
+    timeline whose first entry has not happened yet reads as a data error.
+    """
     rows = session.execute(
         select(JobCard, Part.part_name)
         .join(Part, Part.part_code == JobCard.part_code)
-        .where(JobCard.vin == vin)
+        .where(JobCard.vin == vin, JobCard.event_date <= date.today())
         .order_by(JobCard.event_date.desc(), JobCard.job_card_id.desc())
         .limit(limit)
     ).all()
@@ -870,6 +886,33 @@ def get_rul_detail(session: Session, scope: Scope, vin: str, part_code: str) -> 
 
 
 # --- customers ---------------------------------------------------------------
+
+
+def filter_options(session: Session, scope: Scope) -> dict:
+    """The distinct values the fleet filters can offer, inside the scope.
+
+    Computed server-side rather than collected from whatever rows a page
+    happened to return: a filter list built from the loaded page silently omits
+    the values that are only present further down the result set, which makes
+    the filter look like it has no matches when it has hundreds.
+    """
+    stmt = limit_vehicles(
+        select(Vehicle.model, Vehicle.variant, Vehicle.region, Vehicle.status).distinct(),
+        scope,
+    )
+    rows = session.execute(stmt).all()
+
+    models = sorted({row[0] for row in rows})
+    variants = sorted({row[1] for row in rows})
+    regions = sorted({row[2] for row in rows})
+    statuses = sorted({row[3] for row in rows})
+
+    return {
+        "models": models,
+        "variants": variants,
+        "regions": regions,
+        "vehicle_statuses": statuses,
+    }
 
 
 def list_customers(session: Session, scope: Scope) -> list[dict]:

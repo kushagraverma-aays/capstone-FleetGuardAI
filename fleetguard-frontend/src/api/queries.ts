@@ -34,6 +34,7 @@ export const keys = {
   root: (scope: ScopeValue) => ["fleetguard", scopeKeyFor(scope)] as const,
   scopeInfo: (scope: ScopeValue) => [...keys.root(scope), "scope-info"] as const,
   customers: (scope: ScopeValue) => [...keys.root(scope), "customers"] as const,
+  filterOptions: (scope: ScopeValue) => [...keys.root(scope), "filter-options"] as const,
   overview: (scope: ScopeValue) => [...keys.root(scope), "overview"] as const,
   predictions: (scope: ScopeValue, filters: object) =>
     [...keys.root(scope), "predictions", filters] as const,
@@ -101,6 +102,16 @@ export function useCustomers() {
     queryKey: keys.customers(scope),
     queryFn: () => api.listCustomers(),
     staleTime: 5 * 60_000,
+  });
+}
+
+/** Filter menu contents. Rarely changes, so it is cached for the session. */
+export function useFilterOptions() {
+  const scope = useScope();
+  return useQuery({
+    queryKey: keys.filterOptions(scope),
+    queryFn: () => api.getFilterOptions(),
+    staleTime: 10 * 60_000,
   });
 }
 

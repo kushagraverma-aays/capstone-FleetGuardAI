@@ -278,6 +278,19 @@ def make_vehicles(rng: random.Random, customers: list[dict], start: date) -> lis
     return vehicles
 
 
+def _event_day(rng: random.Random, week_start: date, horizon: date) -> date:
+    """A day inside the given week, never after the end of the record.
+
+    Weeks are Monday-anchored, so the final week of the observation window runs
+    up to six days past its end. An event landing there is dated in the future,
+    and a workshop event that has not happened yet resets the part's clock in
+    every read model that asks "when was this last replaced" - which then
+    disagrees with a prediction scored from telemetry that stops at the end of
+    the record.
+    """
+    return min(week_start + timedelta(days=rng.randint(0, 6)), horizon)
+
+
 def simulate(
     rng: random.Random,
     vehicles: list[dict],
@@ -285,8 +298,10 @@ def simulate(
     hazard_stress: float = HAZARD_STRESS,
     hazard_age: float = HAZARD_AGE,
     hazard_intercept: float = HAZARD_INTERCEPT,
+    horizon: date | None = None,
 ):
     """Walk the fleet week by week, emitting telemetry and workshop events."""
+    horizon = horizon or weeks[-1] + timedelta(days=6)
     design_life = {p[0]: p[3] for p in PARTS}
     part_costs = {p[0]: (p[4], p[6]) for p in PARTS}
 
@@ -391,7 +406,7 @@ def simulate(
 
                 if failed:
                     unit_cost, labour_hours = part_costs[part_code]
-                    event_day = week_start + timedelta(days=rng.randint(0, 6))
+                    event_day = _event_day(rng, week_start, horizon)
                     job_cards.append(
                         {
                             "vin": vin,
@@ -422,7 +437,7 @@ def simulate(
                 #    design life.
                 if age >= state["preventive_at"]:
                     unit_cost, labour_hours = part_costs[part_code]
-                    event_day = week_start + timedelta(days=rng.randint(0, 6))
+                    event_day = _event_day(rng, week_start, horizon)
                     job_cards.append(
                         {
                             "vin": vin,
@@ -583,6 +598,8 @@ def main() -> int:
         hazard_stress=args.hazard_stress,
         hazard_age=args.hazard_age,
         hazard_intercept=args.hazard_intercept,
+        # No workshop event may be dated after the end of the record.
+        horizon=args.end_date or date.today(),
     )
 
     vehicles_by_vin = {v["vin"]: v for v in vehicles}

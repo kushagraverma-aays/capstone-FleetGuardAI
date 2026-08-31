@@ -34,6 +34,22 @@ export type WorkOrderStatus = "draft" | "scheduled" | "completed" | "cancelled";
 
 export type SortOrder = "asc" | "desc";
 
+/**
+ * **Units on the wire, which are not uniform - read this before formatting.**
+ *
+ * Fractions in 0-1: `failure_probability`, `model_confidence`, `weight`,
+ * `correlation`, `precision`, `coverage`, `red_share`, `TierSlice.share`,
+ * `mean_weight`.
+ *
+ * Already scaled to 0-100: every field named `*_share` on a prediction or a
+ * rule signal (`DriverOut.share`, `RuleSignalOut.share`,
+ * `PredictionOut.top_signal_share`), plus `life_used_pct`,
+ * `median_life_used_pct`, `health_index` and `mean_health_index`.
+ *
+ * `formatPercent(value, { alreadyScaled: true })` is for the second group.
+ * Getting it wrong renders "3,630% of stress", which is how this was found.
+ */
+
 // --- auth and scope ----------------------------------------------------------
 
 export interface LoginRequest {
@@ -74,6 +90,15 @@ export interface CustomerOut {
   vehicle_count?: number;
   red_count?: number;
   cost_exposure?: number;
+}
+
+/** Distinct values the fleet filters offer, computed server-side within the
+ *  caller's scope. Built from the whole result set, not from a loaded page. */
+export interface FilterOptions {
+  models: string[];
+  variants: string[];
+  regions: string[];
+  vehicle_statuses: string[];
 }
 
 // --- overview ----------------------------------------------------------------

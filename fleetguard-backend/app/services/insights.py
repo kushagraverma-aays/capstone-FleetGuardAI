@@ -342,9 +342,15 @@ def cost_exposure(session: Session, scope: Scope, dimension: str = "customer") -
         )
     ).all()
 
-    # The gross avoidable figure per component is a property of the part, so it
-    # is only meaningful on the component slice; elsewhere the exposure column
-    # carries the story and avoidable is reported as the same total.
+    # Avoidable cost per group, on the same definition as the headline total:
+    # the gross saving on the components already flagged RED, not a share of
+    # the probability-weighted exposure beside it. The two answer different
+    # questions and are deliberately not parts of one whole - see the note on
+    # `avoidable_cost` above. Reporting avoidable as a copy of exposure, which
+    # this used to do, made every row look 100% avoidable while the header
+    # said 50%.
+    avoidable_by_key = _avoidable_by_group(session, scope, id_column)
+
     total_exposure = round(sum(float(row[2] or 0.0) for row in rows), 2)
     total_avoidable = avoidable_cost(session, scope)
 
@@ -357,13 +363,60 @@ def cost_exposure(session: Session, scope: Scope, dimension: str = "customer") -
                 "key": str(key),
                 "label": str(label),
                 "exposure": round(float(cost or 0.0), 2),
-                "avoidable": round(float(cost or 0.0), 2),
+                "avoidable": round(avoidable_by_key.get(key, 0.0), 2),
                 "red_count": int(red or 0),
                 "components": int(count or 0),
             }
             for key, label, cost, red, count in rows
         ],
     }
+
+
+def _avoidable_by_group(session: Session, scope: Scope, id_column) -> dict:
+    """Gross avoidable cost per group of the given dimension.
+
+    Same arithmetic as `avoidable_cost`, grouped: every RED component priced at
+    what replacing it on plan saves against replacing it after a roadside
+    failure. Summing this over the groups reproduces the headline figure, which
+    is the property that makes the chart and the sentence above it agree.
+    """
+    rows = session.execute(
+        limit_vehicles(
+            select(id_column, Prediction.part_code, func.count())
+            .join(Vehicle, Vehicle.vin == Prediction.vin)
+            .join(Customer, Customer.customer_id == Vehicle.customer_id)
+            .join(Part, Part.part_code == Prediction.part_code)
+            .where(Prediction.risk_tier == "RED")
+            .group_by(id_column, Prediction.part_code),
+            scope,
+        )
+    ).all()
+    if not rows:
+        return {}
+
+    parts = {part.part_code: part for part in session.execute(select(Part)).scalars()}
+    downtime = dict(
+        session.execute(
+            select(JobCard.part_code, func.avg(JobCard.downtime_hours))
+            .where(JobCard.event_type == "failure")
+            .group_by(JobCard.part_code)
+        ).all()
+    )
+
+    totals: dict = {}
+    for key, part_code, count in rows:
+        part = parts.get(part_code)
+        if part is None:
+            continue
+        observed = downtime.get(part_code)
+        impact = estimate_cost_impact(
+            unit_cost=float(part.unit_cost),
+            labour_hours=float(part.labour_hours),
+            failure_probability=1.0,
+            downtime_hours=float(observed) if observed is not None else None,
+        )
+        totals[key] = totals.get(key, 0.0) + impact.avoidable_cost * int(count)
+    return totals
 
 
 def failure_trends(session: Session, scope: Scope, months: int = TREND_MONTHS) -> dict:

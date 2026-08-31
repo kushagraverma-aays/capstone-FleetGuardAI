@@ -473,3 +473,65 @@ def test_openapi_documents_every_endpoint_with_a_summary(client):
         if not operation.get("summary")
     ]
     assert not missing, f"endpoints without a summary: {missing}"
+
+
+# --- read models must not count events that have not happened yet ------------
+
+
+def test_km_on_part_ignores_a_future_job_card(db, any_prediction, reread):
+    """A workshop event dated tomorrow must not reset the part's clock today.
+
+    The generator places events inside Monday-anchored weeks, so the final week
+    of the record can carry a date a few days past it. Counting such an event
+    made the vehicle drawer read "0 km of 90,000 km" next to "Overdue" - the
+    prediction was scored from telemetry that stops at the end of the record,
+    while this read model had already jumped forward to a swap that has not
+    happened.
+    """
+    from datetime import date, timedelta
+
+    from app.models import JobCard, Vehicle
+    from app.services.fleet_queries import current_km_on_part
+
+    vehicle = db.get(Vehicle, any_prediction.vin)
+    before = current_km_on_part(db, any_prediction.vin, any_prediction.part_code)
+
+    future = JobCard(
+        vin=any_prediction.vin,
+        part_code=any_prediction.part_code,
+        event_date=date.today() + timedelta(days=3),
+        odometer_reading=vehicle.total_km_driven,
+        event_type="preventive",
+        cost=1000.0,
+        downtime_hours=2.0,
+        replaced=True,
+    )
+    db.add(future)
+    db.flush()
+    try:
+        assert current_km_on_part(db, any_prediction.vin, any_prediction.part_code) == before
+    finally:
+        db.delete(future)
+        db.flush()
+
+
+def test_cost_exposure_rows_sum_to_the_headline_avoidable(client):
+    """The bars and the sentence above them must agree.
+
+    Per-row avoidable used to be a copy of that row's exposure, which made
+    every row read as 100% avoidable while the header reported about half.
+    Exposure is probability-weighted over every component; avoidable is the
+    gross saving on the red ones, so the two totals differ - but the rows must
+    add up to their own header.
+    """
+    body = client.get("/api/analytics/cost-exposure", params={"dimension": "customer"}).json()
+
+    assert body["rows"]
+    assert body["total_avoidable"] > 0
+    assert body["total_avoidable"] != body["total_exposure"]
+
+    summed = sum(row["avoidable"] for row in body["rows"])
+    assert abs(summed - body["total_avoidable"]) < 1.0
+
+    for row in body["rows"]:
+        assert row["avoidable"] != row["exposure"]

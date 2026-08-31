@@ -17,6 +17,8 @@ from __future__ import annotations
 import csv
 import io
 
+from sqlalchemy import select
+
 from app.services.scoping import (
     MANUFACTURER_SCOPE,
     Scope,
@@ -89,6 +91,30 @@ def test_notifications_are_limited_to_the_scoped_customer(client, as_customer, c
 def test_customers_list_shows_only_the_caller(client, as_customer, customer_a):
     body = client.get("/api/customers", headers=as_customer).json()
     assert [row["customer_id"] for row in body] == [customer_a]
+
+
+def test_filter_options_are_scoped(client, as_customer, db, customer_a):
+    """A customer's filter menu must not reveal another tenant's fleet.
+
+    The menu is built server-side, so this is the only place the leak could
+    happen - and a customer whose model list matches the whole fleet's has a
+    filter that is describing vehicles it cannot see.
+    """
+    from app.models import Vehicle
+
+    scoped = client.get("/api/filter-options", headers=as_customer).json()
+    everything = client.get("/api/filter-options").json()
+
+    own_models = {
+        model
+        for (model,) in db.execute(
+            select(Vehicle.model).where(Vehicle.customer_id == customer_a).distinct()
+        ).all()
+    }
+    assert set(scoped["models"]) == own_models
+    assert set(scoped["models"]) <= set(everything["models"])
+    assert scoped["regions"]
+    assert set(scoped["regions"]) <= set(everything["regions"])
 
 
 def test_csv_export_is_scoped(client, as_customer, customer_names, customer_a):
