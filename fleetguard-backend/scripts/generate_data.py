@@ -161,7 +161,9 @@ WARRANTY_YEARS = 2
 WARRANTY_KM = 200_000
 WARRANTY_CLAIM_RATE = 0.62
 
-DEMO_PASSWORD = "fleetguard"
+# Configuration, not a constant, so the seeded hash and the password the login
+# screen offers can never drift apart. See Settings.DEMO_PASSWORD.
+DEMO_PASSWORD = settings.DEMO_PASSWORD
 
 
 def sigmoid(x: float) -> float:

@@ -5,7 +5,9 @@ import reactRefresh from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", "node_modules"] },
+  // .vite is Vite's pre-bundled dependency cache - third-party code, already
+  // built, and it trips rules from plugins this project does not load.
+  { ignores: ["dist", "node_modules", ".vite"] },
   {
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     files: ["**/*.{ts,tsx}"],

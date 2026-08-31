@@ -38,7 +38,7 @@ def stub_llm(monkeypatch):
     """
     state = {"calls": 0}
 
-    def fake(messages, tools=None, temperature=0.0, max_tokens=None):
+    def fake(messages, tools=None, temperature=0.0, max_tokens=None, reasoning_effort=None):
         state["calls"] += 1
         already_ran = any(m.get("role") == "tool" for m in messages)
         if tools and not already_ran:
@@ -57,7 +57,7 @@ def stub_llm(monkeypatch):
 
 @pytest.fixture
 def stub_draft(monkeypatch):
-    def fake(messages, tools=None, temperature=0.0, max_tokens=None):
+    def fake(messages, tools=None, temperature=0.0, max_tokens=None, reasoning_effort=None):
         assert tools is None, "the Action Agent must never be given tools"
         return Completion(content="Please stock one Radiator Fan for VIN X within 5 days.")
 

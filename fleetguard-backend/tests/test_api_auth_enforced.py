@@ -114,13 +114,15 @@ def test_a_customer_token_cannot_widen_with_the_scope_header(client, auth_on):
     me = client.get("/api/auth/me", headers=bearer(token)).json()
     other = me["customer_id"] + 1
 
+    # "all" is manufacturer scope, which this token does not have. It is
+    # refused rather than quietly narrowed back: no other customer's rows were
+    # ever reachable either way, but a client that asked to widen and got a 200
+    # has been told it succeeded.
     widened = client.get(
         "/api/predictions", headers={**bearer(token), "X-Customer-Scope": "all"}
     )
-    # "all" resolves to manufacturer scope, which this token does not have; the
-    # request is simply served inside its own tenant.
-    assert widened.status_code == 200
-    assert {row["customer_id"] for row in widened.json()["items"]} == {me["customer_id"]}
+    assert widened.status_code == 403
+    assert widened.json()["error"] == "forbidden"
 
     switched = client.get(
         "/api/predictions", headers={**bearer(token), "X-Customer-Scope": str(other)}
@@ -223,3 +225,90 @@ def test_the_same_route_serves_both_modes_identically(client, auth_on, customer_
         r["vin"] for r in with_header["items"]
     ]
     assert with_token["items"][0].keys() == with_header["items"][0].keys()
+
+
+# --- a token is honoured whether or not it is required -----------------------
+#
+# `AUTH_ENABLED` decides what happens when there is *no* token. A token that is
+# presented always drives role and tenant. That is what makes the sign-in
+# screen mean something during the demo - signing in as the viewer genuinely
+# removes write actions - and it is why turning the flag on later changes
+# nothing anybody can see.
+
+
+def test_a_token_drives_scope_even_with_enforcement_off(client):
+    assert settings.AUTH_ENABLED is False
+    token = token_for(client, CUSTOMER_ADMIN)
+
+    me = client.get("/api/auth/me", headers=bearer(token)).json()
+    assert me["email"] == CUSTOMER_ADMIN
+    assert me["is_manufacturer"] is False
+    assert me["customer_id"] is not None
+
+    # And the data follows the token, not the default manufacturer view.
+    scoped = client.get("/api/vehicles?limit=5", headers=bearer(token)).json()
+    assert {row["customer_id"] for row in scoped["items"]} == {me["customer_id"]}
+
+
+def test_a_viewer_token_is_read_only_with_enforcement_off(client):
+    """The role picked at sign-in has to have teeth, or it is theatre."""
+    assert settings.AUTH_ENABLED is False
+    token = token_for(client, VIEWER)
+
+    me = client.get("/api/auth/me", headers=bearer(token)).json()
+    assert me["role"] == "viewer"
+    assert me["can_write"] is False
+
+    response = client.post(
+        "/api/work-orders",
+        headers=bearer(token),
+        json={"vin": "IRRELEVANT", "part_code": "IRRELEVANT", "priority": "high"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error"] == "forbidden"
+
+
+def test_a_customer_token_still_cannot_be_widened_by_the_header(client):
+    """The header may narrow a manufacturer session, never widen a tenant one."""
+    assert settings.AUTH_ENABLED is False
+    token = token_for(client, CUSTOMER_ADMIN)
+    response = client.get(
+        "/api/vehicles", headers={**bearer(token), "X-Customer-Scope": "all"}
+    )
+    assert response.status_code == 403
+
+
+def test_no_token_still_falls_back_to_the_scope_header(client, as_customer):
+    """The existing demo path is untouched: no token, header decides."""
+    assert settings.AUTH_ENABLED is False
+    me = client.get("/api/auth/me", headers=as_customer).json()
+    assert me["is_manufacturer"] is False
+    assert client.get("/api/auth/me").json()["is_manufacturer"] is True
+
+
+# --- the demo accounts the login screen offers -------------------------------
+
+
+def test_demo_accounts_lists_one_sign_in_per_role(client):
+    payload = client.get("/api/auth/demo-accounts").json()
+    roles = {account["role"] for account in payload["accounts"]}
+    assert roles == {"manufacturer_admin", "customer_admin", "viewer"}
+    for account in payload["accounts"]:
+        assert account["role_label"]
+        assert account["description"]
+
+
+def test_every_demo_account_actually_signs_in(client):
+    """A login screen offering a credential that does not work is worse than none."""
+    for account in client.get("/api/auth/demo-accounts").json()["accounts"]:
+        response = client.post(
+            "/api/auth/login",
+            json={"email": account["email"], "password": account["password"]},
+        )
+        assert response.status_code == 200, account["email"]
+        assert response.json()["role"] == account["role"]
+
+
+def test_demo_accounts_disappear_once_authentication_is_enforced(client, auth_on):
+    """Handing out working credentials is only defensible while nothing is protected."""
+    assert client.get("/api/auth/demo-accounts").status_code == 404

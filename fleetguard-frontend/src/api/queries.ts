@@ -19,6 +19,7 @@ import * as api from "./endpoints";
 import type {
   ChatRequest,
   DraftRequest,
+  LoginRequest,
   NotificationStatus,
   RuleDeployRequest,
   RulePreviewRequest,
@@ -26,7 +27,7 @@ import type {
   WorkOrderCreate,
   WorkOrderUpdate,
 } from "./types";
-import { useScope } from "@/state/session";
+import { useScope, useSession } from "@/state/session";
 import { scopeKey as scopeKeyFor, type ScopeValue } from "./session";
 
 /** Key factory. Everything the app caches hangs off `["fleetguard", scope]`. */
@@ -93,6 +94,48 @@ export function useScopeInfo() {
     queryKey: keys.scopeInfo(scope),
     queryFn: () => api.getScopeInfo(),
     staleTime: 5 * 60_000,
+  });
+}
+
+/**
+ * The seeded sign-ins the login screen offers.
+ *
+ * A 404 is the expected answer once the backend enforces authentication, not a
+ * failure - the screen falls back to the plain email and password form - so it
+ * is never retried and never surfaced as an error.
+ */
+export function useDemoAccounts() {
+  return useQuery({
+    queryKey: ["fleetguard", "demo-accounts"] as const,
+    queryFn: () => api.getDemoAccounts(),
+    retry: false,
+    staleTime: Infinity,
+  });
+}
+
+/**
+ * Sign in.
+ *
+ * The whole cache is cleared on success rather than invalidated: the next
+ * identity may see fewer vehicles than this one, and an invalidated entry is
+ * still served while it refetches, which would show one tenant's rows to the
+ * next person for as long as the request takes.
+ */
+export function useLogin() {
+  const client = useQueryClient();
+  const { signIn } = useSession();
+
+  return useMutation({
+    mutationFn: (body: LoginRequest) => api.login(body),
+    onSuccess: (token) => {
+      client.clear();
+      signIn(token.access_token, {
+        email: token.email,
+        fullName: token.full_name,
+        role: token.role,
+        customerId: token.customer_id,
+      });
+    },
   });
 }
 

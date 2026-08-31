@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.logging_config import get_logger
+from app.models import Customer
 from app.services import agent_tools, llm
 from app.services.scoping import Scope
 
@@ -49,9 +50,27 @@ knowledge of this fleet.
 - If a tool returns found: false, say plainly that the thing was not found. \
 Never substitute a plausible value, and never guess at a VIN.
 - If a tool returns an error, say what failed. Do not retry more than once.
-- Do not calculate new figures from tool results beyond simple totals you can \
-show your working for. Prefer quoting the number the tool gave you.
+- You may add, subtract and take percentages of figures a tool returned, and \
+should when it answers the question - but show which returned figures you \
+used. Never estimate a figure no tool gave you.
 - If you need data you have no tool for, say so.
+
+CHOOSING TOOLS
+
+Call several tools in one turn when a question needs several - it is faster \
+than one per turn, and you have a limited number of turns.
+
+- get_fleet_summary describes the whole of the current view and cannot be \
+narrowed. For anything about one named customer, one model or one region - \
+including how many vehicles they run - use find_vehicles.
+- list_vehicles_by_risk ranks by failure probability: use it for "worst" and \
+"highest risk". list_maintenance_due ranks by remaining life: use it for \
+"next", "overdue", "due this month" and parts ordering.
+- get_notifications returns warnings that have been raised. list_work_orders \
+returns workshop jobs that have been booked. They are different things.
+- When a question is about one vehicle, get_vehicle_risk gives every component \
+at once; reach for explain_prediction, get_rul, get_service_history or \
+get_telemetry_trend when asked why, when, what was done, or what changed.
 
 WHAT THE NUMBERS MEAN
 
@@ -64,25 +83,51 @@ index, so they always agree. If asked, say so.
 coverage is the share of real failures it caught; days of warning is the \
 median lead time.
 - Cost exposure is probability-weighted: the expected cost, not a worst case.
-- Costs are in the fleet's own local currency. Write figures with thousands separators and no currency symbol or code - do not write $ or USD, because you have not been told which currency this is.
+- Costs are in the fleet's own local currency. Write figures with thousands \
+separators and no currency symbol or code - do not write $ or USD, because \
+you have not been told which currency this is.
+- Telematics signals run 0 to 1, where higher is more stressful.
 
 HOW YOU ANSWER
 
-- Lead with the answer, then the supporting figures.
-- Use Markdown tables when comparing three or more things.
-- Keep it short. A fleet manager reading on a phone between calls.
+- Lead with the answer in the first sentence, then the figures that support it.
+- Match the length to the question. A count deserves a sentence. "Why is this \
+truck red", "what should we do this week" or a comparison deserves the \
+supporting detail, in short paragraphs or a Markdown table.
+- Use a Markdown table when comparing three or more things, and bold the \
+figure that is the answer.
+- Never pad. No preamble, no restating the question, no closing offer of \
+further help.
 - Use the units the tools give you: days, kilometres, percentages, currency.
-- Never invent a recommendation the data does not support. If the fleet is \
-healthy, say it is healthy.
+- When the data supports an action - order a part with a long lead time, book \
+a vehicle in before a trip - say it in one line at the end. When it does not, \
+do not invent one. If the fleet is healthy, say it is healthy.
 """
+
+SCOPE_NOTE_ALL = (
+    "You are answering for the manufacturer view: every customer's vehicles are "
+    "in scope. When a question names one customer, filter to them with a tool "
+    "argument rather than quoting a fleet-wide number."
+)
+
+SCOPE_NOTE_CUSTOMER = (
+    "You are answering for a single customer's view. Every tool result is "
+    "already limited to their vehicles, so a fleet total here is their total, "
+    "not the manufacturer's. You cannot see any other customer's data and must "
+    "not speculate about it."
+)
 
 SUGGESTED_QUESTIONS = [
     "Which vehicles need attention today?",
+    "What is overdue right now, and what should we book in first?",
     "What is our total cost exposure, and where is it concentrated?",
     "Which component fails most often across the fleet?",
-    "How accurate is the alternator rule?",
+    "Are failures trending up or down over the last 12 months?",
     "Show me the ten highest-risk trucks.",
     "What is driving the risk on our worst vehicle?",
+    "Which parts should we order now, given their lead times?",
+    "How accurate is the alternator rule?",
+    "Which telematics signals most often come before a failure?",
     "How many vehicles are inside a 30-day remaining life?",
     "Which customer has the worst failure rate?",
 ]
@@ -108,6 +153,33 @@ class AgentReply:
     completion_tokens: int = 0
 
 
+def _scope_messages(session: Session, scope: Scope) -> list[dict[str, Any]]:
+    """The system prompt plus one line saying whose data this is.
+
+    Naming the current view is not a grounding leak - it is the caller's own
+    identity, not a fact about the fleet - and leaving it out was a real
+    defect: asked how many vehicles one named customer ran, the model answered
+    with the count from `get_fleet_summary`, because nothing had told it that
+    the summary covered every customer.
+    """
+    note = insight_scope_note(session, scope)
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": note},
+    ]
+
+
+def insight_scope_note(session: Session, scope: Scope) -> str:
+    if scope.is_manufacturer:
+        return SCOPE_NOTE_ALL
+    name = None
+    if scope.customer_id is not None:
+        customer = session.get(Customer, scope.customer_id)
+        name = customer.name if customer else None
+    subject = f"{name}'s fleet" if name else "one customer's fleet"
+    return f"{SCOPE_NOTE_CUSTOMER} The customer is {subject}."
+
+
 def answer(
     session: Session,
     scope: Scope,
@@ -118,7 +190,7 @@ def answer(
     """Run the loop until the model stops calling tools or the bound is hit."""
     limit = max_rounds or settings.AGENT_MAX_TOOL_ROUNDS
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: list[dict[str, Any]] = _scope_messages(session, scope)
     # Prior turns are replayed as plain text. Tool results from earlier turns
     # are deliberately not replayed: they may be stale, and a number that was
     # true yesterday being quoted as today's is exactly the failure this design
@@ -136,11 +208,33 @@ def answer(
 
     while rounds < limit:
         rounds += 1
-        completion = llm.complete(messages, tools=agent_tools.TOOL_SCHEMAS)
+        # A round that only has to pick a tool is given a small budget and low
+        # reasoning effort. Providers bill `max_tokens` against the per-minute
+        # allowance whether or not it is spent, so asking for the full answer
+        # budget on every round is what exhausts a small plan mid-question.
+        completion = llm.complete(
+            messages,
+            tools=agent_tools.TOOL_SCHEMAS,
+            max_tokens=settings.AGENT_TOOL_ROUND_TOKENS,
+            reasoning_effort=settings.AGENT_TOOL_ROUND_EFFORT,
+        )
         prompt_tokens += completion.prompt_tokens
         completion_tokens += completion.completion_tokens
 
         if not completion.tool_calls:
+            # The model chose to answer rather than call a tool. If it ran out
+            # of room doing so, the small budget was the wrong call for this
+            # question - ask again with the full one rather than showing a
+            # sentence that stops mid-word.
+            if completion.truncated:
+                completion = llm.complete(
+                    messages,
+                    max_tokens=settings.AGENT_MAX_TOKENS,
+                    reasoning_effort=settings.AGENT_ANSWER_EFFORT,
+                )
+                prompt_tokens += completion.prompt_tokens
+                completion_tokens += completion.completion_tokens
+
             return AgentReply(
                 reply=completion.content.strip(),
                 tools_used=[i.tool for i in invocations],
@@ -211,7 +305,11 @@ def answer(
             ),
         }
     )
-    final = llm.complete(messages)
+    final = llm.complete(
+        messages,
+        max_tokens=settings.AGENT_MAX_TOKENS,
+        reasoning_effort=settings.AGENT_ANSWER_EFFORT,
+    )
     prompt_tokens += final.prompt_tokens
     completion_tokens += final.completion_tokens
 

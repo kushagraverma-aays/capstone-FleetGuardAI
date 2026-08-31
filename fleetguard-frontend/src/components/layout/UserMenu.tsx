@@ -8,7 +8,9 @@
  * menu says so rather than implying a sign-in that has not happened.
  */
 
+import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, LogOut, Monitor, Moon, ShieldCheck, Sun } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 import { useScopeInfo } from "@/api/queries";
 import { Menu, MenuItem, MenuLabel, MenuSeparator } from "@/components/ui/Menu";
@@ -30,10 +32,15 @@ function initials(name: string): string {
 export function UserMenu() {
   const { data: scopeInfo } = useScopeInfo();
   const { choice, setChoice } = useTheme();
-  const { token, setToken } = useSession();
+  const { identity, signOut } = useSession();
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
 
-  const name = scopeInfo?.full_name ?? "FleetGuard user";
-  const email = scopeInfo?.email ?? "";
+  // `/api/auth/me` is the authority, but it is a request; the stored identity
+  // fills the menu on the first render after a reload so the name does not
+  // appear a beat late.
+  const name = scopeInfo?.full_name ?? identity?.fullName ?? "FleetGuard user";
+  const email = scopeInfo?.email ?? identity?.email ?? "";
   const roleLabel = scopeInfo?.is_manufacturer ? "Manufacturer" : (scopeInfo?.customer_name ?? "Customer");
 
   return (
@@ -87,21 +94,24 @@ export function UserMenu() {
           {scopeInfo?.auth_enabled === false ? (
             <p className="flex items-start gap-2 px-2.5 py-2 text-[0.75rem] leading-4 text-muted">
               <KeyRound className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              Sign-in is turned off in this deployment. The scope switcher selects the
-              identity; turning AUTH_ENABLED on moves that to a real token with no UI change.
+              This deployment does not require a token, so the API would also answer
+              without one. Your sign-in still decides your role and which
+              organisation you can see.
             </p>
-          ) : (
-            <MenuItem
-              onClick={() => {
-                setToken(null);
-                close();
-              }}
-              disabled={!token}
-            >
-              <LogOut className="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
-              {token ? "Sign out" : "Not signed in"}
-            </MenuItem>
-          )}
+          ) : null}
+          <MenuItem
+            onClick={() => {
+              close();
+              // Clear the cache before the token, so no screen re-renders in
+              // the gap holding the last identity's rows.
+              queryClient.clear();
+              signOut();
+              navigate("/login", { replace: true });
+            }}
+          >
+            <LogOut className="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
+            Sign out
+          </MenuItem>
         </>
       )}
     </Menu>

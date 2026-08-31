@@ -18,8 +18,11 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from app.models import Part, Prediction, Vehicle
-from app.services import agent_tools
+from datetime import date
+
+from app.constants import SIGNALS
+from app.models import Customer, Notification, Part, Prediction, Vehicle, WorkOrder
+from app.services import agent_tools, insights, workflow
 from app.services.scoping import MANUFACTURER_SCOPE, customer_scope
 
 pytestmark = pytest.mark.usefixtures("seeded")
@@ -313,3 +316,273 @@ def test_scope_cannot_be_passed_as_a_tool_argument(db, customer_a):
     )
     # Rejected as a bad argument rather than silently honoured.
     assert result["found"] is False
+
+
+# --- the register and the customer directory ---------------------------------
+
+
+def test_find_vehicles_counts_one_customer_not_the_whole_fleet(db, customer_a):
+    """The defect this tool exists to fix.
+
+    Asked how many vehicles one named customer ran, the assistant used to
+    answer with `get_fleet_summary`, which describes the entire view - so a
+    manufacturer session confidently reported the fleet-wide count as that
+    customer's.
+    """
+    everyone = agent_tools.find_vehicles(db, MANUFACTURER_SCOPE)
+    name = db.get(Customer, customer_a).name
+    just_them = agent_tools.find_vehicles(db, MANUFACTURER_SCOPE, customer=name)
+
+    assert just_them["found"] is True
+    assert just_them["customer"] == name
+    assert 0 < just_them["matching_total"] < everyone["matching_total"]
+    assert sum(just_them["vehicles_by_model"].values()) == just_them["matching_total"]
+
+
+def test_find_vehicles_resolves_a_partial_customer_name(db, customer_a):
+    full = db.get(Customer, customer_a).name
+    partial = full.split()[0]
+    result = agent_tools.find_vehicles(db, MANUFACTURER_SCOPE, customer=partial)
+    assert result["found"] is True
+    assert result["customer"] == full
+
+
+def test_find_vehicles_reports_an_unknown_customer_rather_than_guessing(db):
+    result = agent_tools.find_vehicles(db, MANUFACTURER_SCOPE, customer="Nonexistent Hauliers")
+    assert result["found"] is False
+    assert "not found" in result["message"].lower()
+
+
+def test_find_vehicles_cannot_reach_another_tenant(db, customer_a, customer_b):
+    """A customer asking about a rival gets the same nothing a stranger gets."""
+    other_name = db.get(Customer, customer_b).name
+    result = agent_tools.find_vehicles(db, customer_scope(customer_a), customer=other_name)
+    assert result["found"] is False
+
+
+def test_find_vehicles_breakdown_describes_the_whole_match_not_the_page(db):
+    """A breakdown built from the returned rows would describe only the rows."""
+    result = agent_tools.find_vehicles(db, MANUFACTURER_SCOPE, limit=3)
+    assert result["showing"] == 3
+    assert sum(result["vehicles_by_model"].values()) == result["matching_total"]
+    assert sum(result["vehicles_by_region"].values()) == result["matching_total"]
+
+
+def test_list_customers_shows_one_row_to_a_tenant(db, customer_a):
+    everyone = agent_tools.list_customers(db, MANUFACTURER_SCOPE)
+    theirs = agent_tools.list_customers(db, customer_scope(customer_a))
+    assert len(everyone["customers"]) > 1
+    assert len(theirs["customers"]) == 1
+    assert theirs["customers"][0]["customer"] == db.get(Customer, customer_a).name
+
+
+# --- one vehicle's record ----------------------------------------------------
+
+
+def test_get_service_history_returns_the_workshop_record(db, any_prediction):
+    result = agent_tools.get_service_history(db, MANUFACTURER_SCOPE, any_prediction.vin)
+    assert result["found"] is True
+    assert result["vin"] == any_prediction.vin
+    if result["events_total"]:
+        assert result["failures_total"] + result["preventive_total"] == result["events_total"]
+        assert result["events"][0]["type"] in {"failure", "preventive"}
+
+
+def test_get_service_history_never_lists_a_future_event(db, any_prediction):
+    """A timeline whose newest entry has not happened yet reads as a data error."""
+    result = agent_tools.get_service_history(db, MANUFACTURER_SCOPE, any_prediction.vin)
+    if result["events_total"]:
+        assert result["last_service_date"] <= str(date.today())
+
+
+def test_get_service_history_refuses_an_unknown_vin(db):
+    result = agent_tools.get_service_history(db, MANUFACTURER_SCOPE, "NOTAREALVIN00")
+    assert result["found"] is False
+
+
+def test_get_service_history_is_scoped(db, customer_a, vehicle_of_b):
+    result = agent_tools.get_service_history(db, customer_scope(customer_a), vehicle_of_b.vin)
+    assert result["found"] is False
+
+
+def test_get_telemetry_trend_summarises_rather_than_dumping_weeks(db, any_prediction):
+    result = agent_tools.get_telemetry_trend(db, MANUFACTURER_SCOPE, any_prediction.vin)
+    assert result["found"] is True
+    assert len(result["signals"]) == len(SIGNALS)
+    for row in result["signals"]:
+        assert row["direction"] in {"rising", "falling", "steady"}
+    # Sorted worst-first so the model reads the deteriorating signal at the top.
+    changes = [row["change"] for row in result["signals"]]
+    assert changes == sorted(changes, reverse=True)
+
+
+def test_get_telemetry_trend_is_scoped(db, customer_a, vehicle_of_b):
+    result = agent_tools.get_telemetry_trend(db, customer_scope(customer_a), vehicle_of_b.vin)
+    assert result["found"] is False
+
+
+# --- scheduling, trends and booked work --------------------------------------
+
+
+def test_list_maintenance_due_orders_by_remaining_life(db):
+    """The scheduling question, which risk ranking does not answer."""
+    result = agent_tools.list_maintenance_due(db, MANUFACTURER_SCOPE, limit=10)
+    assert result["found"] is True
+    days = [row["rul_days"] for row in result["due"]]
+    assert days == sorted(days)
+    assert set(result["band_counts"]) >= {"overdue", "within_30_days"}
+
+
+def test_list_maintenance_due_band_filter_holds(db):
+    result = agent_tools.list_maintenance_due(db, MANUFACTURER_SCOPE, band="overdue", limit=5)
+    if result["found"]:
+        assert all(row["rul_days"] <= 0 for row in result["due"])
+
+
+def test_list_maintenance_due_rejects_an_invented_band(db):
+    result = agent_tools.list_maintenance_due(db, MANUFACTURER_SCOPE, band="quite soon")
+    assert result["found"] is False
+    assert "overdue" in result["message"]
+
+
+def test_list_maintenance_due_is_scoped(db, customer_a):
+    everyone = agent_tools.list_maintenance_due(db, MANUFACTURER_SCOPE)
+    theirs = agent_tools.list_maintenance_due(db, customer_scope(customer_a))
+    assert theirs["matching_total"] < everyone["matching_total"]
+
+
+def test_get_failure_trend_covers_the_recent_months(db):
+    result = agent_tools.get_failure_trend(db, MANUFACTURER_SCOPE, months=12)
+    assert result["found"] is True
+    assert result["months_covered"] >= 1
+    assert result["total_failures"] == sum(m["failures"] for m in result["monthly"])
+    months = [m["month"] for m in result["monthly"]]
+    assert months == sorted(months)
+
+
+def test_get_failure_trend_is_scoped(db, customer_a):
+    everyone = agent_tools.get_failure_trend(db, MANUFACTURER_SCOPE)
+    theirs = agent_tools.get_failure_trend(db, customer_scope(customer_a))
+    assert theirs["total_failures"] <= everyone["total_failures"]
+
+
+def test_get_signal_prevalence_labels_weight_and_prevalence_separately(db):
+    """They are different measures and are easy to conflate into one ranking."""
+    result = agent_tools.get_signal_prevalence(db, MANUFACTURER_SCOPE)
+    assert result["found"] is True
+    for row in result["signals"]:
+        assert "mean_weight_across_rules" in row
+        assert "fleet_mean_value" in row
+
+
+def test_list_work_orders_maps_every_row_it_returns(db, any_prediction):
+    """The row-building path has to be exercised, not just the empty one.
+
+    The first version of this tool read `priority` and `estimated_cost` off a
+    work order row. Neither key exists. Every test at the time filtered down to
+    zero rows, so the mapping never ran and the tool 500ed the first time the
+    assistant asked what work had been raised.
+    """
+    # Raised here rather than relying on the seed, so the mapping is exercised
+    # on a fresh database too. Removed again below, because these tests share
+    # one seeded database and must not leave rows behind for the next one.
+    order = workflow.create_work_order(
+        db,
+        MANUFACTURER_SCOPE,
+        vin=any_prediction.vin,
+        part_code=any_prediction.part_code,
+        notes="Raised by test_list_work_orders_maps_every_row_it_returns.",
+    )
+    try:
+        result = agent_tools.list_work_orders(db, MANUFACTURER_SCOPE, limit=25)
+        assert result["found"] is True
+        assert result["work_orders"]
+
+        mine = next(row for row in result["work_orders"] if row["id"] == order["id"])
+        assert mine["vin"] == any_prediction.vin
+        assert mine["component"] and mine["customer"]
+        assert mine["status"] in workflow.WORK_ORDER_STATUSES
+        assert mine["raised_on"]
+    finally:
+        db.delete(db.get(WorkOrder, order["id"]))
+        db.commit()
+
+
+def test_list_work_orders_says_so_when_there_are_none(db):
+    result = agent_tools.list_work_orders(db, MANUFACTURER_SCOPE, status="cancelled")
+    if not result["found"]:
+        assert "no work orders" in result["message"].lower()
+
+
+def test_list_work_orders_is_scoped(db, customer_a, vehicle_of_b):
+    result = agent_tools.list_work_orders(db, customer_scope(customer_a), vin=vehicle_of_b.vin)
+    assert result["found"] is False
+
+
+# --- the schemas must describe the system, not a plausible version of it -----
+
+
+def test_the_work_order_status_enum_matches_the_real_vocabulary():
+    """A schema enum that does not exist in the data is a confident wrong answer.
+
+    The first version of this schema offered "open" and "in_progress", neither
+    of which this system uses - the value meant is "draft". Filtering on a
+    status that cannot exist returns nothing, and the model reads "nothing
+    matched" as "there are none", so asking about open work orders got the
+    answer "there are no open work orders" while one sat in the table.
+    """
+    schema = next(
+        s for s in agent_tools.TOOL_SCHEMAS if s["function"]["name"] == "list_work_orders"
+    )
+    offered = set(schema["function"]["parameters"]["properties"]["status"]["enum"])
+    assert offered == workflow.WORK_ORDER_STATUSES
+
+
+def test_an_unknown_work_order_status_is_reported_not_filtered_on(db):
+    result = agent_tools.list_work_orders(db, MANUFACTURER_SCOPE, status="open")
+    assert result["found"] is False
+    assert "draft" in result["message"]
+
+
+def _distinct(db, column) -> set[str]:
+    return {value for (value,) in db.execute(select(column).distinct()) if value}
+
+
+def test_every_enum_a_tool_offers_is_a_value_the_data_can_hold(db):
+    """Walk the schemas and check each enum against its source of truth.
+
+    Every enum has to be listed here deliberately - an unreviewed one fails the
+    test rather than passing by default, because the whole failure mode is a
+    value that looks right and does not exist.
+
+    Where there is a named constant, that is the authority. Where the
+    vocabulary only lives in the data (notification severity and audience are
+    written by the generator and never declared), the seeded rows are, so an
+    invented value is still caught.
+    """
+    tiers = _distinct(db, Prediction.risk_tier)
+    known = {
+        ("list_vehicles_by_risk", "tier"): tiers,
+        ("find_vehicles", "tier"): tiers,
+        ("list_work_orders", "status"): workflow.WORK_ORDER_STATUSES,
+        ("get_notifications", "audience"): _distinct(db, Notification.audience),
+        ("get_notifications", "severity"): _distinct(db, Notification.severity),
+        ("get_cost_exposure", "dimension"): set(insights.COST_DIMENSIONS),
+        ("list_maintenance_due", "band"): {
+            "overdue",
+            "within_30_days",
+            "within_90_days",
+            "healthy",
+        },
+    }
+    checked = 0
+    for schema in agent_tools.TOOL_SCHEMAS:
+        name = schema["function"]["name"]
+        for field, spec in schema["function"]["parameters"].get("properties", {}).items():
+            if "enum" not in spec:
+                continue
+            expected = known.get((name, field))
+            assert expected is not None, f"unreviewed enum: {name}.{field}"
+            assert set(spec["enum"]) == expected, f"{name}.{field}"
+            checked += 1
+    assert checked >= 7

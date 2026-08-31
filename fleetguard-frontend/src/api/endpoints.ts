@@ -13,11 +13,13 @@ import type {
   ChatResponse,
   CostExposure,
   CustomerOut,
+  DemoAccounts,
   DraftRequest,
   DraftResponse,
   FailureTrends,
   FilterOptions,
   FleetComparison,
+  LoginRequest,
   NotificationAudience,
   NotificationOut,
   NotificationSeverity,
@@ -39,6 +41,7 @@ import type {
   RulRow,
   ScopeInfo,
   SortOrder,
+  TokenResponse,
   UrgencyBand,
   VehicleDetail,
   VehicleOut,
@@ -122,6 +125,11 @@ const asQuery = (filters: object | undefined): QueryParams =>
 // --- session -----------------------------------------------------------------
 
 export const getScopeInfo = () => request<ScopeInfo>("/api/auth/me");
+
+export const login = (body: LoginRequest) =>
+  request<TokenResponse>("/api/auth/login", { method: "POST", body });
+
+export const getDemoAccounts = () => request<DemoAccounts>("/api/auth/demo-accounts");
 
 export const listCustomers = () => request<CustomerOut[]>("/api/customers");
 

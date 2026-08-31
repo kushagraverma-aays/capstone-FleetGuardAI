@@ -22,7 +22,7 @@ import { formatNumber } from "@/lib/format";
 import { useSession } from "@/state/session";
 
 export function ScopeSwitcher() {
-  const { scope, setScope } = useSession();
+  const { scope, setScope, identity } = useSession();
   const { data: customers, isPending } = useCustomers();
   const { data: scopeInfo } = useScopeInfo();
 
@@ -30,6 +30,25 @@ export function ScopeSwitcher() {
     scope === "all" ? null : customers?.find((customer) => customer.customer_id === scope);
 
   const label = scope === "all" ? "All customers" : (current?.name ?? scopeInfo?.customer_name ?? "Customer");
+
+  // Someone signed in against one organisation has nothing to switch between,
+  // and the API refuses the attempt outright rather than quietly narrowing it
+  // - so offering the control would be offering a 403. It becomes a label
+  // saying which organisation they are in, which is the useful half of it.
+  if (identity && identity.customerId !== null) {
+    return (
+      <div
+        className={cn(
+          "flex h-9 max-w-[15rem] items-center gap-2 rounded-lg border border-hairline",
+          "bg-canvas px-3 text-sm text-ink",
+        )}
+      >
+        <Building2 className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+        <span className="truncate">{scopeInfo?.customer_name ?? label}</span>
+        <span className="shrink-0 text-[0.6875rem] text-faint">Your organisation</span>
+      </div>
+    );
+  }
 
   return (
     <Menu

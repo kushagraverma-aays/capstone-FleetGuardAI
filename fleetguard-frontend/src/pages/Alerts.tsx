@@ -10,7 +10,7 @@
  * working an inbox of hundreds cannot wait 200ms per click.
  */
 
-import { BellOff, Check, ClipboardList, Undo2, X } from "lucide-react";
+import { BellOff, Check, ClipboardList, Eye, Undo2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
@@ -226,6 +226,20 @@ export default function AlertsPage() {
           />
         </div>
       </div>
+
+      {scopeInfo && !scopeInfo.can_write ? (
+        // A row of greyed-out buttons with the reason hidden in a `title`
+        // reads as a broken screen, and a tooltip is not reachable from the
+        // keyboard at all. Say it once, in the open, above the inbox.
+        <p className="flex items-start gap-2 rounded-card border border-hairline bg-surface px-3.5 py-2.5 text-[0.8125rem] leading-5 text-muted">
+          <Eye className="mt-0.5 h-3.5 w-3.5 shrink-0 text-faint" aria-hidden="true" />
+          <span>
+            You are signed in as a read-only viewer, so acknowledging, dismissing
+            and raising work orders are turned off. Everything on this screen is
+            otherwise the same as a fleet administrator sees.
+          </span>
+        </p>
+      ) : null}
 
       {notifications.isError ? (
         <Card>

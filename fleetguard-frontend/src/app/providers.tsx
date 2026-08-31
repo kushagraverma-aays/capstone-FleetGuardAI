@@ -10,6 +10,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MotionConfig } from "framer-motion";
 import { useState, type ReactNode } from "react";
 
 import { ApiError } from "@/api/client";
@@ -43,9 +44,20 @@ export function Providers({ children }: { children: ReactNode }) {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <ThemeProvider>
-        <ToastProvider>{children}</ToastProvider>
-      </ThemeProvider>
+      {/*
+        `reducedMotion="user"` makes every animation in the product honour the
+        operating system setting, in one place, rather than each component
+        remembering to ask. Framer Motion's "user" mode drops transform and
+        layout animation - the movement that causes trouble - and keeps opacity,
+        so a screen still fades in rather than appearing with no transition at
+        all. Without this the setting was simply ignored: nothing in the app
+        read it.
+      */}
+      <MotionConfig reducedMotion="user">
+        <ThemeProvider>
+          <ToastProvider>{children}</ToastProvider>
+        </ThemeProvider>
+      </MotionConfig>
     </QueryClientProvider>
   );
 }

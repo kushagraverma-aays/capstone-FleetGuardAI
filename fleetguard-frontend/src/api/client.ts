@@ -12,7 +12,7 @@
  *    error envelope, so screens branch on a slug rather than on a sentence.
  */
 
-import { getSession, scopeHeaderValue } from "./session";
+import { getSession, scopeHeaderValue, signOut } from "./session";
 
 /**
  * Empty by default: the app calls "/api/..." on its own origin, which the Vite
@@ -163,7 +163,20 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     );
   }
 
-  if (!response.ok) throw await toApiError(response);
+  if (!response.ok) {
+    const error = await toApiError(response);
+    // An expired or rejected token must not be kept. Clearing it here rather
+    // than in a screen means every route reacts at once - the guard sees no
+    // token and shows the sign-in form - instead of each screen discovering
+    // the dead session separately at its own next request. `/api/auth/login`
+    // is excluded: a wrong password is a 401 that has nothing to do with the
+    // session, and signing out in response to it would be a strange thing for
+    // a login form to do.
+    if (error.status === 401 && !path.startsWith("/api/auth/login")) {
+      signOut();
+    }
+    throw error;
+  }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }

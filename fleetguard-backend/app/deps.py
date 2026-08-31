@@ -3,16 +3,27 @@
 `get_current_scope()` is the single place where an HTTP request turns into a
 tenant boundary. Spec section 3 requires that **the route code is identical
 whether authentication is on or off** - only this dependency changes
-behaviour:
+behaviour.
 
-  AUTH_ENABLED=false   the `X-Customer-Scope` header drives access, which is
-                       what the UI's scope switcher sets.
-  AUTH_ENABLED=true    the bearer token drives access, and the header may only
-                       *narrow* a manufacturer session, never widen a
-                       customer one.
+A presented bearer token always drives access. `AUTH_ENABLED` decides only
+what happens when there is no token:
 
-That asymmetry is the whole security property. A customer-scoped token that
-could set the header back to "all" would make the header an authentication
+  no token,  AUTH_ENABLED=false   the `X-Customer-Scope` header drives access,
+                                  which is what the UI's scope switcher sets.
+  no token,  AUTH_ENABLED=true    401.
+  token,     either               the JWT drives role and tenant; the header
+                                  may only *narrow* a manufacturer session,
+                                  never widen a customer one.
+
+Honouring a token even while enforcement is off is what makes the sign-in
+screen mean something during the demo: signing in as the read-only viewer
+genuinely takes write actions away, and turning `AUTH_ENABLED` on later changes
+nothing a user can see. It gives away no security, because with the flag off
+there is nothing to give away - an unauthenticated caller can still set the
+header, exactly as before.
+
+The narrowing asymmetry is the real security property. A customer-scoped token
+that could set the header back to "all" would make the header an authentication
 bypass, so the header is rejected outright in that case rather than ignored -
 silently ignoring it would let a broken client believe it had switched.
 """
@@ -121,8 +132,15 @@ def get_current_scope(
 ) -> Scope:
     """Resolve the tenant boundary for this request. Every query passes here."""
     requested = _parse_scope_header(x_customer_scope)
+    token = _bearer_token(request)
 
-    if not settings.AUTH_ENABLED:
+    if token is None:
+        if settings.AUTH_ENABLED:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication is required. Send a bearer token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         if requested is not None:
             _require_customer(db, requested)
             # The switcher standing in for a customer login: read-write inside
@@ -141,18 +159,19 @@ def get_current_scope(
             full_name="Demo manufacturer administrator",
         )
 
-    token = _bearer_token(request)
-    if token is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication is required. Send a bearer token.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
     user = _user_from_token(db, token)
 
     if user.customer_id is not None:
         # A tenant-bound token cannot be talked out of its tenant.
-        if requested is not None and requested != user.customer_id:
+        #
+        # Note the test is on whether the header was *sent*, not on what it
+        # parsed to. `X-Customer-Scope: all` parses to None, the same value as
+        # no header at all, so checking only `requested is not None` let the
+        # one request that matters - a tenant asking for the manufacturer view
+        # - through to be quietly narrowed back to its own data. No other
+        # customer's rows were ever reachable, but a client that asked to
+        # widen and got a 200 has been told it succeeded.
+        if x_customer_scope is not None and requested != user.customer_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Your account may only view its own organisation's data.",

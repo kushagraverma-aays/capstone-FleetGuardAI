@@ -140,8 +140,10 @@ function ErrorBubble({ turn, onRetry }: { turn: FailedTurn; onRetry: () => void 
   // Branch on the slug, never on the sentence - the same rule `ErrorState`
   // follows, so the two describe an outage the same way.
   const message =
-    slug === "rate_limited"
-      ? "The assistant is rate limited to protect its budget. Wait a moment and ask again."
+    slug === "llm_busy"
+      ? "This minute's allowance of language model capacity is spent. Wait a few seconds and ask again - nothing is broken."
+      : slug === "rate_limited"
+        ? "The assistant is rate limited to protect its budget. Wait a moment and ask again."
       : slug === "llm_unavailable"
         ? "The language model provider could not be reached. Every other screen still works - none of them depend on it."
         : slug === "network_error"

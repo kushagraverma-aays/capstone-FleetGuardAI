@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     JWT_SECRET: str = Field(..., description="HMAC secret for signing JWTs")
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 720
+    # The password the seed script hashes for all three demo users, and the one
+    # /api/auth/demo-accounts hands to the login screen. It is configuration
+    # rather than a constant in the seed script so that the two can never drift
+    # apart, and it is only ever served while AUTH_ENABLED is false.
+    DEMO_PASSWORD: str = "fleetguard"
 
     # --- llm (spec 7) --------------------------------------------------------
     # An OpenAI-compatible client pointed at Groq. Swapping provider is a
@@ -64,6 +69,15 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_SECONDS: float = 60.0
     AGENT_MAX_TOOL_ROUNDS: int = 6
     AGENT_MAX_TOKENS: int = 2500
+    # Providers charge `max_tokens` against the per-minute token allowance when
+    # the request is made, not when the tokens are used. A round that only has
+    # to choose a tool needs a fraction of the answer budget, and asking for the
+    # full amount on every round is what exhausts a small plan mid-question.
+    AGENT_TOOL_ROUND_TOKENS: int = 1200
+    # Honoured by reasoning models, ignored by others. Tool selection is not a
+    # hard reasoning problem; composing the final answer sometimes is.
+    AGENT_TOOL_ROUND_EFFORT: str = "low"
+    AGENT_ANSWER_EFFORT: str = "medium"
 
     # --- http ----------------------------------------------------------------
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:3000"

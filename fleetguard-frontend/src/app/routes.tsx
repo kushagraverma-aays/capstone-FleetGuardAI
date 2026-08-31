@@ -8,11 +8,38 @@
  * a link to one truck.
  */
 
-import { lazy, Suspense } from "react";
-import { Route, Routes } from "react-router-dom";
+import { lazy, Suspense, type ReactNode } from "react";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { AppShell } from "@/components/layout/AppShell";
 import { SkeletonCard, SkeletonKpiRow } from "@/components/ui/Skeleton";
+import { useSession } from "@/state/session";
+
+const Login = lazy(() => import("@/pages/Login"));
+
+/**
+ * The gate in front of the product.
+ *
+ * It checks only that a token exists - the API is what decides what that token
+ * can reach, and a client-side check that tried to be the authority would be
+ * both wrong and reassuring. The path being left is passed along so signing in
+ * lands on the page that was asked for rather than the dashboard.
+ */
+function RequireSignIn({ children }: { children: ReactNode }) {
+  const { isSignedIn } = useSession();
+  const location = useLocation();
+
+  if (!isSignedIn) {
+    return (
+      <Navigate
+        to="/login"
+        replace
+        state={{ from: location.pathname + location.search }}
+      />
+    );
+  }
+  return <>{children}</>;
+}
 
 const CommandCentre = lazy(() => import("@/pages/CommandCentre"));
 const Fleet = lazy(() => import("@/pages/Fleet"));
@@ -40,7 +67,21 @@ function RouteFallback() {
 export function AppRoutes() {
   return (
     <Routes>
-      <Route element={<AppShell />}>
+      <Route
+        path="/login"
+        element={
+          <Suspense fallback={null}>
+            <Login />
+          </Suspense>
+        }
+      />
+      <Route
+        element={
+          <RequireSignIn>
+            <AppShell />
+          </RequireSignIn>
+        }
+      >
         <Route
           path="/"
           element={

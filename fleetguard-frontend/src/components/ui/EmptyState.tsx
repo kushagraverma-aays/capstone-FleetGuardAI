@@ -123,6 +123,14 @@ function explain(error: unknown): Explained {
             "The language model provider could not be reached. Every other screen still works - the dashboard does not depend on it.",
           retryable: true,
         };
+      case "llm_busy":
+        return {
+          icon: AlertCircle,
+          title: "The assistant is busy",
+          description:
+            "This minute's allowance of language model capacity is spent. Wait a few seconds and ask again - nothing is broken.",
+          retryable: true,
+        };
       case "rate_limited":
         return {
           icon: AlertCircle,

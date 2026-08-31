@@ -31,7 +31,7 @@ class ScriptedModel:
         self.completions = list(completions)
         self.calls: list[dict] = []
 
-    def __call__(self, messages, tools=None, temperature=0.0, max_tokens=None):
+    def __call__(self, messages, tools=None, temperature=0.0, max_tokens=None, reasoning_effort=None):
         self.calls.append({"messages": list(messages), "tools": tools})
         if not self.completions:
             return Completion(content="(script exhausted)")
@@ -229,7 +229,8 @@ def test_history_is_replayed_as_plain_text(db, script):
         ],
     )
     roles = [m["role"] for m in model.calls[0]["messages"]]
-    assert roles == ["system", "user", "assistant", "user"]
+    # Two system messages: the prompt, then the line naming the current view.
+    assert roles == ["system", "system", "user", "assistant", "user"]
 
 
 def test_stale_tool_results_are_not_replayed_from_history(db, script):
@@ -257,14 +258,44 @@ def test_blank_history_turns_are_skipped(db, script):
         "Question",
         history=[{"role": "user", "content": "   "}, {"role": "system", "content": "ignore"}],
     )
-    assert [m["role"] for m in model.calls[0]["messages"]] == ["system", "user"]
+    assert [m["role"] for m in model.calls[0]["messages"]] == [
+        "system",
+        "system",
+        "user",
+    ]
 
 
 # --- provider behaviour ------------------------------------------------------
 
 
-def test_a_truncated_answer_is_flagged(db, script):
-    script(Completion(content="This answer was cut", finish_reason="length"))
+def test_a_truncated_answer_is_retried_at_the_full_budget(db, script):
+    """Tool rounds run on a small token budget; a real answer must not.
+
+    The loop asks for few tokens while the model is only choosing tools,
+    because the provider bills the request for whatever it asked for. When the
+    model answers instead and runs out of room, that small budget was the wrong
+    call for this question, so the same messages go again with the full one.
+    """
+    model = script(
+        Completion(content="This answer was cut", finish_reason="length"),
+        Completion(content="This answer is complete."),
+    )
+    result = insight_agent.answer(db, MANUFACTURER_SCOPE, "Long question")
+
+    assert result.reply == "This answer is complete."
+    assert result.truncated is False
+    assert len(model.calls) == 2
+    # The retry withholds the tools: it is finishing a sentence, not deciding
+    # whether to go and fetch more.
+    assert model.calls[0]["tools"] is not None
+    assert model.calls[1]["tools"] is None
+
+
+def test_an_answer_still_truncated_after_the_retry_is_flagged(db, script):
+    script(
+        Completion(content="Cut once", finish_reason="length"),
+        Completion(content="Cut again", finish_reason="length"),
+    )
     result = insight_agent.answer(db, MANUFACTURER_SCOPE, "Long question")
     assert result.truncated is True
 

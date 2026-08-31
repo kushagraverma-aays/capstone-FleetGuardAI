@@ -14,7 +14,10 @@ import {
   scopeKey,
   setScope,
   setToken,
+  signIn,
+  signOut,
   subscribeToSession,
+  type Identity,
   type ScopeValue,
 } from "@/api/session";
 
@@ -27,10 +30,20 @@ export function useSession() {
   return {
     scope: state.scope,
     token: state.token,
+    identity: state.identity,
+    /** True once someone has signed in. The router shows the app on this and
+     *  the login screen otherwise; the server still decides what the token can
+     *  actually reach. */
+    isSignedIn: state.token !== null,
     /** Cache-key fragment for the current scope. */
     scopeKey: scopeKey(state.scope),
     setScope: changeScope,
     setToken: changeToken,
+    signIn: useCallback(
+      (token: string, identity: Identity) => signIn(token, identity),
+      [],
+    ),
+    signOut: useCallback(() => signOut(), []),
   };
 }
 

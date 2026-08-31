@@ -67,6 +67,27 @@ export interface TokenResponse {
   email: string;
 }
 
+/** One seeded sign-in offered on the login screen.
+ *
+ *  Served only while the backend has `AUTH_ENABLED=false`; the endpoint 404s
+ *  once enforcement is on, and the form falls back to plain email and
+ *  password. Nothing in the UI hardcodes a credential. */
+export interface DemoAccount {
+  email: string;
+  password: string;
+  full_name: string;
+  role: string;
+  role_label: string;
+  description: string;
+  customer_id: number | null;
+  customer_name: string | null;
+}
+
+export interface DemoAccounts {
+  accounts: DemoAccount[];
+  note: string;
+}
+
 /** What the UI is allowed to do. Drive disabled states from `can_write` and
  *  `can_manage_rules` rather than re-deriving the role rules in the client. */
 export interface ScopeInfo {

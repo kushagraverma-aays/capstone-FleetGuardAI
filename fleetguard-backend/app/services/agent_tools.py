@@ -28,8 +28,8 @@ from typing import Any, Callable
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.constants import SIGNAL_LABELS
-from app.models import Part, Prediction, Vehicle
+from app.constants import SIGNAL_LABELS, SIGNALS
+from app.models import Customer, Part, Prediction, Vehicle
 from app.services import fleet_queries, insights, rules_engine, workflow
 from app.services.fleet_queries import PredictionFilters
 from app.services.scoping import Scope, limit_vehicles
@@ -65,6 +65,46 @@ def _vehicle_in_scope(session: Session, scope: Scope, vin: str) -> Vehicle | Non
     return session.execute(
         limit_vehicles(select(Vehicle).where(Vehicle.vin == vin.strip().upper()), scope)
     ).scalars().first()
+
+
+def resolve_customer(session: Session, scope: Scope, value: str | None) -> Customer | None:
+    """Accept a customer name, a partial name, or a numeric id.
+
+    The model is answering questions typed by a person, and a person writes
+    "BlueLine" rather than "customer_id 2". A tenant-scoped caller can only
+    ever resolve their own organisation, so this cannot be used to discover
+    that another customer exists.
+    """
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    stmt = select(Customer)
+    if not scope.is_manufacturer:
+        stmt = stmt.where(Customer.customer_id == scope.customer_id)
+
+    if cleaned.isdigit():
+        found = session.execute(
+            stmt.where(Customer.customer_id == int(cleaned))
+        ).scalars().first()
+        if found is not None:
+            return found
+
+    exact = session.execute(
+        stmt.where(func.lower(Customer.name) == cleaned.lower())
+    ).scalars().first()
+    if exact is not None:
+        return exact
+    return session.execute(
+        stmt.where(Customer.name.ilike(f"%{cleaned}%")).order_by(Customer.name)
+    ).scalars().first()
+
+
+def known_customers_message(session: Session, scope: Scope) -> str:
+    stmt = select(Customer.name).order_by(Customer.name)
+    if not scope.is_manufacturer:
+        stmt = stmt.where(Customer.customer_id == scope.customer_id)
+    names = list(session.execute(stmt).scalars())
+    return "Customers in this view are: " + ", ".join(names) + "."
 
 
 def known_components_message(session: Session) -> str:
@@ -475,6 +515,417 @@ def compare_customers(session: Session, scope: Scope) -> dict:
     }
 
 
+def find_vehicles(
+    session: Session,
+    scope: Scope,
+    customer: str | None = None,
+    model: str | None = None,
+    region: str | None = None,
+    status: str | None = None,
+    tier: str | None = None,
+    search: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """Search the vehicle register, and describe the shape of what matched.
+
+    This is the tool for "how many", "which models" and "show me the trucks in
+    the North" - questions about the register itself rather than about risk.
+    `get_fleet_summary` answers for the whole current view and cannot be
+    narrowed, which is what previously made "how many vehicles does customer X
+    operate?" come back with the fleet-wide number.
+
+    The composition counts come back alongside the rows because the count is
+    usually the answer and the rows are only the evidence.
+    """
+    customer_row = None
+    if customer:
+        customer_row = resolve_customer(session, scope, customer)
+        if customer_row is None:
+            return _not_found(
+                f"Customer {customer!r}", known_customers_message(session, scope)
+            )
+
+    rows, total = fleet_queries.list_vehicles(
+        session,
+        scope,
+        customer_ids=[customer_row.customer_id] if customer_row else None,
+        regions=[region] if region else None,
+        models=[model] if model else None,
+        statuses=[status] if status else None,
+        tiers=[tier.upper()] if tier else None,
+        search=search,
+        limit=min(max(int(limit), 0), MAX_ROWS),
+        offset=0,
+    )
+
+    # Composition over the whole match, not over the page: a breakdown built
+    # from ten returned rows would describe the ten, and be quoted as if it
+    # described the six hundred.
+    stmt = limit_vehicles(
+        select(Vehicle.model, Vehicle.region, Vehicle.status, func.count()).group_by(
+            Vehicle.model, Vehicle.region, Vehicle.status
+        ),
+        scope,
+    )
+    if customer_row:
+        stmt = stmt.where(Vehicle.customer_id == customer_row.customer_id)
+    if model:
+        stmt = stmt.where(Vehicle.model == model)
+    if region:
+        stmt = stmt.where(Vehicle.region == region)
+    if status:
+        stmt = stmt.where(Vehicle.status == status)
+
+    by_model: dict[str, int] = {}
+    by_region: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for model_name, region_name, status_name, count in session.execute(stmt).all():
+        by_model[model_name] = by_model.get(model_name, 0) + int(count)
+        by_region[region_name] = by_region.get(region_name, 0) + int(count)
+        by_status[status_name] = by_status.get(status_name, 0) + int(count)
+
+    if total == 0:
+        return {
+            "found": False,
+            "message": "No vehicles match those filters in this view.",
+            "matching_total": 0,
+        }
+
+    return {
+        "found": True,
+        "matching_total": total,
+        "customer": customer_row.name if customer_row else None,
+        "vehicles_by_model": dict(sorted(by_model.items(), key=lambda kv: -kv[1])),
+        "vehicles_by_region": dict(sorted(by_region.items(), key=lambda kv: -kv[1])),
+        "vehicles_by_status": by_status,
+        "showing": len(rows),
+        "vehicles": [
+            {
+                "vin": r["vin"],
+                "customer": r["customer_name"],
+                "model": r["model"],
+                "variant": r["variant"],
+                "region": r["region"],
+                "odometer_km": r["total_km_driven"],
+                "status": r["status"],
+                "risk_tier": r["risk_tier"],
+                "worst_component": r["worst_part_name"],
+                "min_rul_days": None
+                if r["min_rul_days"] is None
+                else round(r["min_rul_days"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+def list_customers(session: Session, scope: Scope) -> dict:
+    """The customer register: who they are and how large each fleet is."""
+    rows = fleet_queries.list_customers(session, scope)
+    if not rows:
+        return {"found": False, "message": "No customers are visible in this view."}
+    return {
+        "found": True,
+        "customers": [
+            {
+                "customer": r["name"],
+                "region": r["region"],
+                "contract_tier": r["contract_tier"],
+                "vehicles": r["vehicle_count"],
+                "red_components": r["red_count"],
+                "cost_exposure": r["cost_exposure"],
+            }
+            for r in rows
+        ],
+    }
+
+
+def get_service_history(session: Session, scope: Scope, vin: str, limit: int = 12) -> dict:
+    """The workshop record for one vehicle: what was replaced, when, at what cost."""
+    vehicle = _vehicle_in_scope(session, scope, vin)
+    if vehicle is None:
+        return _not_found(
+            f"Vehicle {vin!r}",
+            "Either the VIN does not exist or it belongs to another customer.",
+        )
+
+    events = fleet_queries.vehicle_service_history(session, vehicle.vin, limit=200)
+    if not events:
+        return {
+            "found": True,
+            "vin": vehicle.vin,
+            "events_total": 0,
+            "message": "This vehicle has no recorded workshop events.",
+            "events": [],
+        }
+
+    shown = events[: min(max(int(limit), 1), MAX_ROWS)]
+    failures = sum(1 for e in events if e["event_type"] == "failure")
+    return {
+        "found": True,
+        "vin": vehicle.vin,
+        "events_total": len(events),
+        "failures_total": failures,
+        "preventive_total": len(events) - failures,
+        "last_service_date": str(events[0]["event_date"]),
+        "total_spend": round(sum(e["cost"] for e in events), 2),
+        "total_downtime_hours": round(sum(e["downtime_hours"] for e in events), 1),
+        "showing": len(shown),
+        "events": [
+            {
+                "date": str(e["event_date"]),
+                "component": e["part_name"],
+                "type": e["event_type"],
+                "odometer_km": e["odometer_reading"],
+                "cost": e["cost"],
+                "downtime_hours": e["downtime_hours"],
+            }
+            for e in shown
+        ],
+    }
+
+
+def get_telemetry_trend(session: Session, scope: Scope, vin: str) -> dict:
+    """How one vehicle is being driven, and which signals are getting worse.
+
+    Deliberately a summary rather than the raw weeks. Fifty-two weeks of nine
+    signals is several thousand tokens of numbers the model would then have to
+    do arithmetic on, and arithmetic is where a grounded assistant stops being
+    grounded. The comparison it actually needs - the recent weeks against the
+    ones before them - is computed here, and it quotes the result.
+    """
+    vehicle = _vehicle_in_scope(session, scope, vin)
+    if vehicle is None:
+        return _not_found(
+            f"Vehicle {vin!r}",
+            "Either the VIN does not exist or it belongs to another customer.",
+        )
+
+    weeks = fleet_queries.vehicle_telemetry(session, vehicle.vin, weeks=8)
+    if len(weeks) < 2:
+        return {
+            "found": False,
+            "message": (
+                f"There is not enough telematics history for {vehicle.vin} "
+                "to show a trend."
+            ),
+        }
+
+    half = len(weeks) // 2
+    earlier, recent = weeks[:half], weeks[half:]
+
+    def mean(rows: list[dict], signal: str) -> float:
+        return sum(r["signals"][signal] for r in rows) / len(rows)
+
+    signals = []
+    for signal in SIGNALS:
+        now, before = mean(recent, signal), mean(earlier, signal)
+        change = now - before
+        signals.append(
+            {
+                "signal": SIGNAL_LABELS.get(signal, signal),
+                "recent_mean": round(now, 3),
+                "previous_mean": round(before, 3),
+                "direction": (
+                    "rising" if change > 0.02 else "falling" if change < -0.02 else "steady"
+                ),
+                "change": round(change, 3),
+            }
+        )
+    signals.sort(key=lambda row: row["change"], reverse=True)
+
+    return {
+        "found": True,
+        "vin": vehicle.vin,
+        "weeks_compared": (
+            f"most recent {len(recent)} weeks against the {len(earlier)} before them"
+        ),
+        "period_end": str(weeks[-1]["week_start_date"]),
+        "recent_weekly_km": round(sum(r["week_km"] for r in recent) / len(recent)),
+        "signal_scale": "0 to 1, where higher is more stressful",
+        "signals": signals,
+    }
+
+
+def list_maintenance_due(
+    session: Session,
+    scope: Scope,
+    band: str | None = None,
+    part: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """What has to be booked in, soonest first, with the band counts alongside.
+
+    Ordered by remaining life rather than by probability, which is the
+    difference between "what is next" and "what is worst" - a scheduling
+    question and a triage question are not the same question, and
+    `list_vehicles_by_risk` only answers the second one.
+    """
+    bands = {
+        "overdue": fleet_queries.BAND_OVERDUE,
+        "within_30_days": fleet_queries.BAND_30,
+        "within_90_days": fleet_queries.BAND_90,
+        "healthy": fleet_queries.BAND_HEALTHY,
+    }
+    if band and band not in bands:
+        return {
+            "found": False,
+            "message": f"{band!r} is not a band. Choose one of: " + ", ".join(bands) + ".",
+        }
+
+    part_row = resolve_part(session, part)
+    if part and part_row is None:
+        return _not_found(f"Component {part!r}", known_components_message(session))
+
+    filters = PredictionFilters(part_codes=[part_row.part_code] if part_row else None)
+    counts = fleet_queries.rul_bands(session, scope, filters)
+    rows, total = fleet_queries.list_rul(
+        session,
+        scope,
+        filters,
+        band=bands.get(band) if band else None,
+        limit=min(max(int(limit), 1), MAX_ROWS),
+        offset=0,
+    )
+
+    if not rows:
+        return {
+            "found": False,
+            "message": f"Nothing falls in band={band or 'any'} for this view.",
+            "band_counts": counts,
+        }
+
+    return {
+        "found": True,
+        "band_counts": counts,
+        "band_meanings": {
+            "overdue": "already past its estimated useful life",
+            "within_30_days": "1 to 30 days of life left",
+            "within_90_days": "31 to 90 days of life left",
+            "healthy": "more than 90 days of life left",
+        },
+        "matching_total": total,
+        "showing": len(rows),
+        "due": [
+            {
+                "vin": r["vin"],
+                "customer": r["customer_name"],
+                "component": r["part_name"],
+                "rul_days": round(r["rul_days"]),
+                "rul_km": round(r["rul_km"]),
+                "risk_tier": r["risk_tier"],
+                "part_lead_time_days": r["lead_time_days"],
+                "cost_exposure": r["estimated_cost_impact"],
+            }
+            for r in rows
+        ],
+    }
+
+
+def get_failure_trend(session: Session, scope: Scope, months: int = 12) -> dict:
+    """Failures and planned replacements per month over the recent past."""
+    rows = insights.failure_trend(session, scope, months=min(max(int(months), 1), 24))
+    if not rows:
+        return {"found": False, "message": "There is no workshop history in this view."}
+
+    return {
+        "found": True,
+        "months_covered": len(rows),
+        "total_failures": sum(r["failures"] for r in rows),
+        "total_preventive": sum(r["preventive"] for r in rows),
+        "busiest_month": max(rows, key=lambda r: r["failures"])["month"],
+        "monthly": rows,
+    }
+
+
+def get_signal_prevalence(session: Session, scope: Scope) -> dict:
+    """Which telematics signals the deployed rules lean on, and how high they run.
+
+    Weight is what the engine relies on; the fleet mean is how prevalent the
+    signal is right now. They answer different questions and are easy to
+    conflate, so both are labelled rather than merged into one ranking.
+    """
+    rows = insights.top_signals(session, scope, limit=9)
+    if not rows:
+        return {
+            "found": False,
+            "message": "No rules are deployed, so no signals are weighted.",
+        }
+    return {
+        "found": True,
+        "signal_scale": "0 to 1, where higher is more stressful",
+        "signals": [
+            {
+                "signal": r["label"],
+                "mean_weight_across_rules": r["mean_weight"],
+                "components_using_it": r["components"],
+                "fleet_mean_value": r["fleet_mean_value"],
+            }
+            for r in rows
+        ],
+    }
+
+
+def list_work_orders(
+    session: Session,
+    scope: Scope,
+    status: str | None = None,
+    vin: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """Workshop jobs that have been raised: what is booked, and what is still open."""
+    # A status this system does not use must be reported, not filtered on. A
+    # filter for a value that cannot exist returns nothing, and "nothing
+    # matched" reads to the model as "there are none" - so asking for the
+    # "open" work orders would have it announce there were none, when what is
+    # meant here is "draft".
+    if status and status not in workflow.WORK_ORDER_STATUSES:
+        return {
+            "found": False,
+            "message": (
+                f"{status!r} is not a work order status. Choose one of: "
+                + ", ".join(sorted(workflow.WORK_ORDER_STATUSES))
+                + ". A job that has been raised but not yet booked is 'draft'."
+            ),
+        }
+
+    rows, total = workflow.list_work_orders(
+        session,
+        scope,
+        statuses=[status] if status else None,
+        vin=vin.strip().upper() if vin else None,
+        limit=min(max(int(limit), 1), MAX_ROWS),
+        offset=0,
+    )
+    if not rows:
+        return {
+            "found": False,
+            "message": (
+                f"There are no work orders matching status={status or 'any'} "
+                "in this view."
+            ),
+            "matching_total": 0,
+        }
+    return {
+        "found": True,
+        "matching_total": total,
+        "showing": len(rows),
+        "work_orders": [
+            {
+                "id": r["id"],
+                "vin": r["vin"],
+                "component": r["part_name"],
+                "customer": r["customer_name"],
+                "status": r["status"],
+                "scheduled_date": str(r["scheduled_date"]) if r["scheduled_date"] else None,
+                "raised_on": str(r["created_at"].date()) if r["created_at"] else None,
+                "notes": r["notes"],
+            }
+            for r in rows
+        ],
+    }
+
+
 # --- registry ----------------------------------------------------------------
 
 TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
@@ -488,6 +939,14 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
     "get_notifications": get_notifications,
     "get_cost_exposure": get_cost_exposure,
     "compare_customers": compare_customers,
+    "find_vehicles": find_vehicles,
+    "list_customers": list_customers,
+    "get_service_history": get_service_history,
+    "get_telemetry_trend": get_telemetry_trend,
+    "list_maintenance_due": list_maintenance_due,
+    "get_failure_trend": get_failure_trend,
+    "get_signal_prevalence": get_signal_prevalence,
+    "list_work_orders": list_work_orders,
 }
 
 # The schemas the model sees. Descriptions are written for the model, not for a
@@ -691,6 +1150,164 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     }
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_vehicles",
+            "description": (
+                "Search the vehicle register and count what matches. Use this for "
+                "'how many vehicles does <customer> have', 'which models do they "
+                "run', 'list the trucks in <region>', or any question about fleet "
+                "size or composition. Returns the total, a breakdown by model, "
+                "region and status, and example rows."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer": {"type": "string", "description": "Customer name, full or partial."},
+                    "model": {"type": "string", "description": "Exact vehicle model."},
+                    "region": {"type": "string", "description": "Operating region."},
+                    "status": {"type": "string", "description": "e.g. active, workshop, retired."},
+                    "tier": {
+                        "type": "string",
+                        "enum": ["RED", "AMBER", "GREEN"],
+                        "description": "Worst component tier on the vehicle.",
+                    },
+                    "search": {"type": "string", "description": "Free text over VIN and model."},
+                    "limit": {"type": "integer", "description": "Example rows, 0-25. Default 10."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_customers",
+            "description": (
+                "The customer register: name, region, contract tier, fleet size and "
+                "exposure for each. Use it to answer who the customers are or how "
+                "large each fleet is."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_service_history",
+            "description": (
+                "The workshop record for one vehicle: when it was last serviced, "
+                "what was replaced, whether each event was a failure or a planned "
+                "swap, the cost and the downtime."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vin": {"type": "string", "description": "The vehicle identification number."},
+                    "limit": {"type": "integer", "description": "Events to list, 1-25. Default 12."},
+                },
+                "required": ["vin"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_telemetry_trend",
+            "description": (
+                "How one vehicle is being driven lately and which telematics signals "
+                "are rising or falling, comparing the recent weeks with the ones "
+                "before them. Use it for 'is it getting worse' and 'why is this truck "
+                "under stress'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vin": {"type": "string", "description": "The vehicle identification number."}
+                },
+                "required": ["vin"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_maintenance_due",
+            "description": (
+                "What needs booking in, soonest first, with counts per urgency band. "
+                "Use this for scheduling questions - what is overdue, what is due in "
+                "the next 30 days, what to order parts for. Ordered by remaining life, "
+                "unlike list_vehicles_by_risk which is ordered by probability."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "band": {
+                        "type": "string",
+                        "enum": ["overdue", "within_30_days", "within_90_days", "healthy"],
+                        "description": "Restrict to one urgency band. Omit for all.",
+                    },
+                    "part": {"type": "string", "description": "Component name or code."},
+                    "limit": {"type": "integer", "description": "Rows, 1-25. Default 10."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_failure_trend",
+            "description": (
+                "Failures and planned replacements per month over the recent past. "
+                "Use it for 'are failures going up', 'how many failures last year', "
+                "or 'which month was worst'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "months": {"type": "integer", "description": "Months back, 1-24. Default 12."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_signal_prevalence",
+            "description": (
+                "Which telematics signals the deployed rules weight most heavily, and "
+                "how high each runs across the fleet right now. Use it for 'what are "
+                "the common precursors' or 'what is driving failures generally'."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_work_orders",
+            "description": (
+                "Workshop jobs that have already been raised, with status, priority "
+                "and scheduled date. Alerts are warnings; work orders are the booked "
+                "work that followed. Use get_notifications for the former."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": sorted(workflow.WORK_ORDER_STATUSES),
+                        "description": (
+                            "Restrict to one status. A job raised but not yet "
+                            "booked into a workshop is 'draft'."
+                        ),
+                    },
+                    "vin": {"type": "string", "description": "Only this vehicle's work orders."},
+                    "limit": {"type": "integer", "description": "Rows, 1-25. Default 10."},
+                },
             },
         },
     },

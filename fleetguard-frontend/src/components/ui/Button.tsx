@@ -16,8 +16,13 @@ type Variant = "primary" | "secondary" | "ghost" | "danger";
 type Size = "sm" | "md";
 
 const VARIANTS: Record<Variant, string> = {
+  // The disabled primary dims the label as well as the fill. At 40% accent
+  // with full-strength white text it still read as a live button on a dark
+  // canvas - a read-only viewer saw a bright blue "Work order" they could not
+  // press, which looks broken rather than unavailable.
   primary:
-    "bg-accent text-white hover:bg-accent/90 active:bg-accent/95 disabled:bg-accent/40",
+    "bg-accent text-white hover:bg-accent/90 active:bg-accent/95 " +
+    "disabled:bg-accent/25 disabled:text-white/45",
   secondary:
     "border border-hairline bg-surface text-ink hover:bg-canvas active:bg-canvas disabled:text-faint",
   ghost: "text-muted hover:bg-canvas hover:text-ink disabled:text-faint",

@@ -49,6 +49,31 @@ class ScopeInfo(ApiModel):
     auth_enabled: bool
 
 
+class DemoAccount(ApiModel):
+    """One seeded sign-in offered on the login screen.
+
+    Served only while `AUTH_ENABLED` is false. The password is included on
+    purpose - these are fixtures created by the seed script for a walkthrough,
+    and a demo that makes you go and find a password in a script is a demo
+    nobody completes. The endpoint disappears entirely the moment enforcement
+    is switched on, so the credentials cannot outlive the demo.
+    """
+
+    email: str
+    password: str
+    full_name: str
+    role: str
+    role_label: str
+    description: str
+    customer_id: int | None = None
+    customer_name: str | None = None
+
+
+class DemoAccounts(ApiModel):
+    accounts: list[DemoAccount]
+    note: str
+
+
 class Acknowledgement(ApiModel):
     """Plain confirmation for actions with nothing useful to return."""
 

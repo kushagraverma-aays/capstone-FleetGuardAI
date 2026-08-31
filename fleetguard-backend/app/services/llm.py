@@ -13,6 +13,8 @@ Everything above this module deals in plain dictionaries and the small
 from __future__ import annotations
 
 import json
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,6 +31,17 @@ class UpstreamLLMError(RuntimeError):
 
     Defined here rather than in `main` so that services never import the web
     layer; `main` imports it from here to register the handler.
+    """
+
+
+class LLMBudgetExceeded(UpstreamLLMError):
+    """The provider's per-minute token budget is spent.
+
+    A subclass rather than a flag because this is the one upstream failure that
+    is *expected* on a small plan and that the person asking can act on - wait
+    a moment and ask again. The API turns it into a 429 with its own slug so
+    the assistant panel can say "busy" instead of "unavailable", which are very
+    different sentences to read.
     """
 
 
@@ -87,11 +100,22 @@ def complete(
     tools: list[dict[str, Any]] | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> Completion:
-    """One round trip to the provider.
+    """One round trip to the provider, retried once if the budget resets soon.
 
     Temperature defaults to zero: this assistant reports numbers that came out
     of a database, and creative variation in that is a defect, not a feature.
+
+    `max_tokens` is not only a cap on the answer - providers charge it against
+    the per-minute token allowance the moment the request is made, whether or
+    not it is used. Asking for 2,500 tokens to emit a two-line tool call spends
+    2,500 tokens of budget, so the agent loop passes a small figure for
+    tool-selection rounds and the full figure only when prose is expected.
+
+    `reasoning_effort` is honoured by reasoning models (Groq's gpt-oss family
+    among them) and ignored by the rest. Choosing which tool to call is not
+    hard reasoning; writing the final answer sometimes is.
     """
     client = get_client()
     request: dict[str, Any] = {
@@ -100,30 +124,13 @@ def complete(
         "temperature": temperature,
         "max_tokens": max_tokens or settings.AGENT_MAX_TOKENS,
     }
+    if reasoning_effort:
+        request["reasoning_effort"] = reasoning_effort
     if tools:
         request["tools"] = tools
         request["tool_choice"] = "auto"
 
-    try:
-        response = client.chat.completions.create(**request)
-    except APITimeoutError as exc:
-        raise UpstreamLLMError(
-            f"The language model did not respond within "
-            f"{settings.LLM_TIMEOUT_SECONDS:.0f} seconds."
-        ) from exc
-    except APIConnectionError as exc:
-        raise UpstreamLLMError(
-            f"Could not reach the language model provider at {settings.LLM_BASE_URL}."
-        ) from exc
-    except APIStatusError as exc:
-        # Pass the provider's own message through: "model decommissioned" or
-        # "rate limit exceeded" is exactly what the operator needs to see.
-        raise UpstreamLLMError(
-            f"The language model provider returned {exc.status_code}: "
-            f"{_provider_message(exc)}"
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - any SDK failure is an upstream failure
-        raise UpstreamLLMError(f"The language model call failed: {exc}") from exc
+    response = _create_with_backoff(client, request)
 
     choice = response.choices[0]
     message = choice.message
@@ -146,6 +153,71 @@ def complete(
         prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
         completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
     )
+
+
+# How long we are willing to hold a request open waiting for the provider's
+# token bucket to refill. A per-minute allowance refills continuously, so the
+# wait is usually a second or two; anything longer is better reported than
+# waited out, because the browser is holding a spinner the whole time.
+_MAX_BACKOFF_SECONDS = 8.0
+_RETRY_HINT = re.compile(r"try again in ([0-9.]+)\s*(ms|s)\b", re.IGNORECASE)
+
+
+def _create_with_backoff(client: OpenAI, request: dict[str, Any]):
+    """Issue the request, waiting out one short rate-limit window if offered.
+
+    The SDK's own retries do not help here: it backs off on a fixed schedule
+    that ignores the provider's stated reset time, so it either waits far
+    longer than needed or gives up just before the bucket refills. The provider
+    tells us exactly how long to wait, so we use that.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return client.chat.completions.create(**request)
+        except APITimeoutError as exc:
+            raise UpstreamLLMError(
+                f"The language model did not respond within "
+                f"{settings.LLM_TIMEOUT_SECONDS:.0f} seconds."
+            ) from exc
+        except APIConnectionError as exc:
+            raise UpstreamLLMError(
+                f"Could not reach the language model provider at "
+                f"{settings.LLM_BASE_URL}."
+            ) from exc
+        except APIStatusError as exc:
+            detail = _provider_message(exc)
+            if exc.status_code != 429:
+                # Pass the provider's own message through: "model decommissioned"
+                # is exactly what the operator needs to see.
+                raise UpstreamLLMError(
+                    f"The language model provider returned {exc.status_code}: {detail}"
+                ) from exc
+
+            wait = _retry_after_seconds(exc, detail)
+            if attempt == 1 and wait is not None and wait <= _MAX_BACKOFF_SECONDS:
+                log.info("llm_rate_limited_retrying", extra={"wait_seconds": wait})
+                time.sleep(wait)
+                continue
+            raise LLMBudgetExceeded(detail) from exc
+        except Exception as exc:  # noqa: BLE001 - any SDK failure is upstream
+            raise UpstreamLLMError(f"The language model call failed: {exc}") from exc
+
+
+def _retry_after_seconds(exc: APIStatusError, detail: str) -> float | None:
+    """How long the provider says to wait, from the header or its own message."""
+    header = exc.response.headers.get("retry-after") if exc.response is not None else None
+    if header:
+        try:
+            return float(header)
+        except ValueError:
+            pass
+    match = _RETRY_HINT.search(detail)
+    if match:
+        value = float(match.group(1))
+        return value / 1000 if match.group(2).lower() == "ms" else value
+    return None
 
 
 def _parse_arguments(raw: str | None, tool_name: str) -> dict[str, Any]:

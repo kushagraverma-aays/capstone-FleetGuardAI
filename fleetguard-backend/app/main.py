@@ -22,7 +22,7 @@ from app.db import ping
 from app.rate_limit import limiter, rate_limit_response
 from app.routers import auth, chat, export, fleet, insights, rules, workflow
 from app.logging_config import configure_logging, get_logger, new_request_id, request_id_var
-from app.services.llm import UpstreamLLMError
+from app.services.llm import LLMBudgetExceeded, UpstreamLLMError
 
 configure_logging()
 log = get_logger("fleetguard.api")
@@ -131,6 +131,25 @@ def create_app() -> FastAPI:
                 "request_id": request_id_var.get(),
             },
             headers=exc.headers,
+        )
+
+    @app.exception_handler(LLMBudgetExceeded)
+    async def llm_budget_handler(request: Request, exc: LLMBudgetExceeded):
+        # 429, not 502. The provider is up and the request was well formed; the
+        # minute's token allowance is simply spent. That is a wait, not a
+        # failure, and the assistant panel words the two very differently.
+        log.warning("llm_budget_exceeded", extra={"detail": str(exc)})
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "error": "llm_busy",
+                "message": (
+                    "The assistant has used this minute's allowance of language "
+                    "model capacity. Wait a few seconds and ask again."
+                ),
+                "provider_message": str(exc),
+                "request_id": request_id_var.get(),
+            },
         )
 
     @app.exception_handler(UpstreamLLMError)
