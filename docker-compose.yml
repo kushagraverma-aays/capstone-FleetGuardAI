@@ -59,12 +59,11 @@ services:
              python -m scripts.manage score --if-empty &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
-  # The frontend is built in phase 6. Until its directory exists, this service
-  # is behind a profile so `docker compose up` brings up the working stack
-  # rather than failing on a missing build context. Once fleetguard-frontend/
-  # is present, delete the `profiles` line and it joins the default stack.
+  # nginx serving the built bundle, and proxying /api/ to the backend over the
+  # compose network. One origin for the whole product: the browser never makes
+  # a cross-origin call, so there is no CORS preflight and no API base URL to
+  # configure per environment.
   frontend:
-    profiles: ["frontend"]
     build: ./fleetguard-frontend
     container_name: fleetguard-frontend
     restart: unless-stopped
@@ -72,6 +71,12 @@ services:
       - backend
     ports:
       - "5173:80"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
 volumes:
   mysql_data:
