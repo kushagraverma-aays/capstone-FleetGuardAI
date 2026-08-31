@@ -1,41 +1,164 @@
+"""FastAPI application factory and global middleware.
+
+Routers are registered here; all business logic lives in app/services so the
+same functions can later be called from a batch job or an Azure Function
+without dragging FastAPI along.
+"""
+
 from __future__ import annotations
 
-from fastapi import FastAPI
+import time
+
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
-from app.routers import chat, notifications, overview, parts, predictions, rul, rules
-from app.config import CORS_ORIGINS
-from app.db import engine
-from app.routers import overview, parts, predictions, rul, rules
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 
-app = FastAPI(
-    title="FleetGuard AI",
-    description="Predictive Failure Engine for commercial vehicle fleets",
-    version="0.1.0",
-)
+from app.config import settings
+from app.db import ping
+from app.logging_config import configure_logging, get_logger, new_request_id, request_id_var
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.include_router(rul.router)
-app.include_router(notifications.router)
-app.include_router(chat.router)
-app.include_router(overview.router)
-app.include_router(parts.router)
-app.include_router(rules.router)
-app.include_router(predictions.router)
-app.include_router(rul.router)
+configure_logging()
+log = get_logger("fleetguard.api")
 
 
-@app.get("/api/health", tags=["system"])
-def health():
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return {"status": "ok", "database": "connected"}
-    except Exception as exc:
-        return {"status": "degraded", "database": str(exc)}
+class UpstreamLLMError(RuntimeError):
+    """Raised when the LLM provider fails. Surfaces as 502 with its message."""
+
+
+def create_app() -> FastAPI:
+    if not settings.auth_secret_ready:
+        # Not fatal while AUTH_ENABLED is false - the demo runs on the scope
+        # header - but it must not be discovered the day auth is switched on.
+        log.warning(
+            "JWT_SECRET is blank or under 32 characters. Login and token "
+            "issuing are unsafe until it is set; AUTH_ENABLED=true will "
+            "refuse to start."
+        )
+
+    app = FastAPI(
+        title=settings.APP_NAME,
+        version="1.0.0",
+        description=(
+            "Predictive maintenance for commercial vehicle fleets. "
+            "Signals in, ranked risk and remaining useful life out."
+        ),
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
+    )
+
+    @app.middleware("http")
+    async def request_context(request: Request, call_next):
+        rid = request.headers.get("X-Request-ID") or new_request_id()
+        token = request_id_var.set(rid)
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        response.headers["X-Request-ID"] = rid
+        log.info(
+            "request",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": elapsed_ms,
+            },
+        )
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(request: Request, exc: RequestValidationError):
+        # Actionable 422: say which field and why, not a raw pydantic dump.
+        problems = [
+            {
+                "field": ".".join(str(p) for p in err["loc"][1:]) or "body",
+                "problem": err["msg"],
+            }
+            for err in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": "invalid_request",
+                "message": "The request could not be processed as sent.",
+                "problems": problems,
+                "request_id": request_id_var.get(),
+            },
+        )
+
+    @app.exception_handler(UpstreamLLMError)
+    async def llm_handler(request: Request, exc: UpstreamLLMError):
+        log.error("llm_upstream_failure", extra={"detail": str(exc)})
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "error": "llm_unavailable",
+                "message": "The language model provider could not be reached.",
+                "provider_message": str(exc),
+                "request_id": request_id_var.get(),
+            },
+        )
+
+    @app.exception_handler(SQLAlchemyError)
+    async def db_handler(request: Request, exc: SQLAlchemyError):
+        log.exception("database_error")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": "database_error",
+                "message": "A database error occurred.",
+                "request_id": request_id_var.get(),
+            },
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_handler(request: Request, exc: Exception):
+        # Stack traces go to the log, never to the client.
+        log.exception("unhandled_error")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": "internal_error",
+                "message": "Something went wrong on our side.",
+                "request_id": request_id_var.get(),
+            },
+        )
+
+    @app.get("/api/health", tags=["system"], summary="Liveness probe")
+    def health() -> dict:
+        return {
+            "status": "ok",
+            "app": settings.APP_NAME,
+            "environment": settings.ENVIRONMENT,
+        }
+
+    @app.get("/api/health/ready", tags=["system"], summary="Readiness probe")
+    def ready() -> JSONResponse:
+        database_ok = ping()
+        llm_ok = settings.llm_configured
+        payload = {
+            "status": "ready" if database_ok else "degraded",
+            "database": "ok" if database_ok else "unreachable",
+            "llm": "configured" if llm_ok else "not_configured",
+        }
+        code = status.HTTP_200_OK if database_ok else status.HTTP_503_SERVICE_UNAVAILABLE
+        return JSONResponse(status_code=code, content=payload)
+
+    return app
+
+
+app = create_app()

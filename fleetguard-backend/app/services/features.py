@@ -1,129 +1,198 @@
+"""Feature table construction (spec section 6.1).
+
+One row per (vin, part_code, week) carrying:
+  * the nine telematics signals smoothed with a 4-week rolling mean,
+  * km_on_part - the odometer since this part was last installed,
+  * age_fraction - km_on_part over the design life,
+  * failed_within_horizon - the binary label.
+
+These are plain functions over a SQLAlchemy session and pandas frames, with no
+FastAPI in sight, so the same code backs the REST API, the agent tools and the
+offline validation script.
+"""
+
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
-from sqlalchemy.engine import Engine
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from app.config import LABEL_HORIZON_DAYS, ROLLING_WEEKS, SIGNALS
+from app.constants import LABEL_HORIZON_DAYS, ROLLING_WEEKS, SIGNALS
+from app.models import JobCard, Part, TelematicsWeekly
 
-_cache: dict[str, pd.DataFrame] = {}
-
-
-def invalidate_cache() -> None:
-    _cache.clear()
-
-
-def load_raw(engine: Engine) -> dict[str, pd.DataFrame]:
-    if "vehicles" in _cache:
-        return {k: _cache[k] for k in ("vehicles", "parts", "jobcards", "telematics")}
-
-    vehicles = pd.read_sql("SELECT * FROM vehicle_master", engine)
-    parts = pd.read_sql("SELECT * FROM part_master", engine)
-    jobcards = pd.read_sql("SELECT * FROM job_cards", engine)
-    telematics = pd.read_sql("SELECT * FROM telematics_weekly", engine)
-
-    if not jobcards.empty:
-        jobcards["failure_date"] = pd.to_datetime(jobcards["failure_date"])
-    if not telematics.empty:
-        telematics["week_start_date"] = pd.to_datetime(telematics["week_start_date"])
-    if not vehicles.empty:
-        vehicles["registration_date"] = pd.to_datetime(vehicles["registration_date"])
-
-    _cache.update(vehicles=vehicles, parts=parts, jobcards=jobcards, telematics=telematics)
-    return {"vehicles": vehicles, "parts": parts, "jobcards": jobcards, "telematics": telematics}
+# Every workshop event installs a fresh part, so all three reset the part clock:
+# a fitment is the initial install, a failure is replaced on the spot, and a
+# preventive swap is a planned replacement.
+INSTALL_EVENTS = ("fitment", "failure", "preventive")
 
 
-def build_features(engine: Engine) -> pd.DataFrame:
-    if "features" in _cache:
-        return _cache["features"]
-
-    raw = load_raw(engine)
-    tel, jobs, parts, veh = raw["telematics"], raw["jobcards"], raw["parts"], raw["vehicles"]
-
-    if tel.empty or parts.empty:
-        _cache["features"] = pd.DataFrame()
-        return _cache["features"]
-
-    tel = tel.sort_values(["vin", "week_start_date"]).copy()
-    for sig in SIGNALS:
-        tel[sig] = (
-            tel.groupby("vin")[sig]
-            .transform(lambda s: s.rolling(ROLLING_WEEKS, min_periods=1).mean())
-            .clip(0, 1)
-        )
-
-    tel = tel[["vin", "week_start_date", "odometer_km", "week_km"] + SIGNALS]
-    tel = tel.sort_values("week_start_date").reset_index(drop=True)
-
-    frames = []
-    for part in parts.itertuples():
-        block = tel.copy()
-        block["part_code"] = part.part_code
-        block["design_life_km"] = part.design_life_km
-
-        part_jobs = jobs[jobs["part_code"] == part.part_code] if not jobs.empty else jobs
-
-        if part_jobs is None or part_jobs.empty:
-            block["last_replacement_km"] = 0.0
-            block["next_failure_date"] = pd.NaT
-            block["label_failed_30d"] = 0
-        else:
-            replaced = (
-                part_jobs[part_jobs["replaced"].astype(bool)][
-                    ["vin", "failure_date", "odometer_at_failure"]
-                ]
-                .sort_values("failure_date")
-                .reset_index(drop=True)
-            )
-            if replaced.empty:
-                block["last_replacement_km"] = 0.0
-            else:
-                block = pd.merge_asof(
-                    block,
-                    replaced,
-                    left_on="week_start_date",
-                    right_on="failure_date",
-                    by="vin",
-                    direction="backward",
-                )
-                block["last_replacement_km"] = block["odometer_at_failure"].fillna(0.0)
-                block = block.drop(columns=["odometer_at_failure", "failure_date"])
-
-            failures_only = part_jobs[part_jobs.get("event_type", "failure") == "failure"]
-            upcoming = (
-                failures_only[["vin", "failure_date"]]
-                .sort_values("failure_date")
-                .reset_index(drop=True)
-            )
-            block = block.sort_values("week_start_date").reset_index(drop=True)
-            block = pd.merge_asof(
-                block,
-                upcoming,
-                left_on="week_start_date",
-                right_on="failure_date",
-                by="vin",
-                direction="forward",
-            )
-            block = block.rename(columns={"failure_date": "next_failure_date"})
-            gap = (block["next_failure_date"] - block["week_start_date"]).dt.days
-            block["label_failed_30d"] = ((gap >= 0) & (gap <= LABEL_HORIZON_DAYS)).astype(int)
-
-        block["km_on_part"] = (block["odometer_km"] - block["last_replacement_km"]).clip(lower=0)
-        block["age_fraction"] = (block["km_on_part"] / block["design_life_km"]).clip(0, 1.3)
-        frames.append(block)
-
-    out = pd.concat(frames, ignore_index=True)
-    out = out.merge(
-        veh[["vin", "model", "region", "avg_km_per_day", "fleet_operator"]], on="vin", how="left"
+def load_telematics(session: Session) -> pd.DataFrame:
+    columns = [
+        TelematicsWeekly.vin,
+        TelematicsWeekly.week_start_date,
+        TelematicsWeekly.week_km,
+        TelematicsWeekly.odometer_km,
+        *[getattr(TelematicsWeekly, signal) for signal in SIGNALS],
+    ]
+    frame = pd.DataFrame(
+        session.execute(select(*columns)).all(),
+        columns=["vin", "week_start_date", "week_km", "odometer_km", *SIGNALS],
     )
-    out = out.sort_values(["part_code", "vin", "week_start_date"]).reset_index(drop=True)
-
-    _cache["features"] = out
-    return out
-
-
-def latest_week(feats: pd.DataFrame) -> pd.Timestamp:
-    return feats["week_start_date"].max()
+    if frame.empty:
+        return frame
+    frame["week_start_date"] = pd.to_datetime(frame["week_start_date"])
+    return frame.sort_values(["vin", "week_start_date"]).reset_index(drop=True)
 
 
-def current_slice(feats: pd.DataFrame) -> pd.DataFrame:
-    return feats[feats["week_start_date"] == latest_week(feats)].copy()
+def load_job_cards(session: Session) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        session.execute(
+            select(
+                JobCard.vin,
+                JobCard.part_code,
+                JobCard.event_date,
+                JobCard.odometer_reading,
+                JobCard.event_type,
+            )
+        ).all(),
+        columns=["vin", "part_code", "event_date", "odometer_reading", "event_type"],
+    )
+    if frame.empty:
+        return frame
+    frame["event_date"] = pd.to_datetime(frame["event_date"])
+    return frame
+
+
+def load_parts(session: Session) -> pd.DataFrame:
+    return pd.DataFrame(
+        session.execute(
+            select(Part.part_code, Part.part_name, Part.category, Part.design_life_km)
+        ).all(),
+        columns=["part_code", "part_name", "category", "design_life_km"],
+    )
+
+
+def smooth_signals(telematics: pd.DataFrame) -> pd.DataFrame:
+    """4-week rolling mean per vehicle.
+
+    Weekly telematics is noisy enough that a single bad week can flip a
+    ranking; smoothing is what makes the correlations stable.
+    """
+    frame = telematics.copy()
+    grouped = frame.groupby("vin", sort=False)[SIGNALS]
+    frame[SIGNALS] = grouped.transform(
+        lambda s: s.rolling(ROLLING_WEEKS, min_periods=1).mean()
+    )
+    return frame
+
+
+def build_feature_table(
+    session: Session,
+    part_codes: list[str] | None = None,
+) -> pd.DataFrame:
+    """Cross the weekly telemetry with every tracked component."""
+    telematics = load_telematics(session)
+    job_cards = load_job_cards(session)
+    parts = load_parts(session)
+
+    if telematics.empty or parts.empty:
+        return pd.DataFrame()
+
+    if part_codes:
+        parts = parts[parts["part_code"].isin(part_codes)]
+        job_cards = job_cards[job_cards["part_code"].isin(part_codes)]
+
+    smoothed = smooth_signals(telematics)
+
+    # Cross join: every vehicle-week is evaluated against every component.
+    features = smoothed.merge(parts[["part_code", "design_life_km"]], how="cross")
+    features = features.sort_values(["week_start_date", "vin", "part_code"]).reset_index(
+        drop=True
+    )
+
+    features = _attach_km_on_part(features, job_cards)
+    features = _attach_label(features, job_cards)
+
+    features["age_fraction"] = features["km_on_part"] / features["design_life_km"]
+    return features
+
+
+def _attach_km_on_part(features: pd.DataFrame, job_cards: pd.DataFrame) -> pd.DataFrame:
+    """Odometer since the current part was installed.
+
+    Without fitment records this is uncomputable, and RUL - which is about the
+    part, not the truck - would be meaningless.
+    """
+    installs = (
+        job_cards[job_cards["event_type"].isin(INSTALL_EVENTS)]
+        .loc[:, ["vin", "part_code", "event_date", "odometer_reading"]]
+        .rename(columns={"odometer_reading": "install_odometer"})
+        .sort_values("event_date")
+        .reset_index(drop=True)
+    )
+
+    if installs.empty:
+        features["install_odometer"] = 0
+        features["km_on_part"] = features["odometer_km"]
+        return features
+
+    merged = pd.merge_asof(
+        features,
+        installs,
+        left_on="week_start_date",
+        right_on="event_date",
+        by=["vin", "part_code"],
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    merged["install_odometer"] = merged["install_odometer"].fillna(0)
+    merged["km_on_part"] = (
+        merged["odometer_km"] - merged["install_odometer"]
+    ).clip(lower=0)
+    return merged.drop(columns=["event_date"])
+
+
+def _attach_label(features: pd.DataFrame, job_cards: pd.DataFrame) -> pd.DataFrame:
+    """failed_within_horizon: does a real failure follow inside 90 days?
+
+    Only event_type == 'failure' counts. Preventive swaps and fitments are
+    planned work, and labelling them as failures would teach the model that
+    good maintenance is a fault.
+    """
+    failures = (
+        job_cards[job_cards["event_type"] == "failure"]
+        .loc[:, ["vin", "part_code", "event_date"]]
+        .rename(columns={"event_date": "next_failure_date"})
+        .sort_values("next_failure_date")
+        .reset_index(drop=True)
+    )
+
+    if failures.empty:
+        features["next_failure_date"] = pd.NaT
+        features["days_to_failure"] = np.nan
+        features["failed_within_horizon"] = 0
+        return features
+
+    merged = pd.merge_asof(
+        features,
+        failures,
+        left_on="week_start_date",
+        right_on="next_failure_date",
+        by=["vin", "part_code"],
+        direction="forward",
+        allow_exact_matches=True,
+    )
+    merged["days_to_failure"] = (
+        merged["next_failure_date"] - merged["week_start_date"]
+    ).dt.days
+    merged["failed_within_horizon"] = (
+        merged["days_to_failure"].between(0, LABEL_HORIZON_DAYS).astype(int)
+    )
+    return merged
+
+
+def latest_week(features: pd.DataFrame) -> pd.Timestamp | None:
+    if features.empty:
+        return None
+    return features["week_start_date"].max()
