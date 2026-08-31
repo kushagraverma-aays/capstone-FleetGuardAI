@@ -23,13 +23,19 @@ from app.config import DATA_DIR, settings
 from app.constants import SIGNALS
 from app.db import SessionLocal
 from app.models import (
+    AuditLog,
     Customer,
     JobCard,
+    Notification,
     Part,
+    Prediction,
+    Rule,
+    RuleSignal,
     TelematicsWeekly,
     User,
     Vehicle,
     WarrantyClaim,
+    WorkOrder,
 )
 from app.security import hash_password
 
@@ -122,11 +128,18 @@ N_VEHICLES = 600
 N_WEEKS = 52
 
 # hazard = sigmoid(HAZARD_STRESS*stress + HAZARD_AGE*age - HAZARD_INTERCEPT)
-# The intercept is tuned so total failures land in the 1,000-1,500 band; the
-# generator prints the count so a retune is obvious.
-HAZARD_STRESS = 6.0
+#
+# The spec suggested 6.0 / 7.9 / 13.4. Two changes were needed:
+#   * the intercept had to rise a long way - 13.4 produced 2,945 failures
+#     against a target band of 1,000-1,500;
+#   * the stress coefficient was raised from 6.0 to 14.0 so the signals
+#     genuinely discriminate. At 6.0 age swamped stress near end of life and
+#     signal recovery sat at 96.4%; at 14.0 it is 100% and back-test
+#     precision improves too. Age still dominates near end of life, which the
+#     generator verifies and prints on every run.
+HAZARD_STRESS = 14.0
 HAZARD_AGE = 7.9
-HAZARD_INTERCEPT = 15.05
+HAZARD_INTERCEPT = 19.9
 
 # A flat, signal-independent hazard producing roughly 10% of all failures.
 # A model that hits perfect precision is a red flag, not a selling point.
@@ -265,7 +278,14 @@ def make_vehicles(rng: random.Random, customers: list[dict], start: date) -> lis
     return vehicles
 
 
-def simulate(rng: random.Random, vehicles: list[dict], weeks: list[date]):
+def simulate(
+    rng: random.Random,
+    vehicles: list[dict],
+    weeks: list[date],
+    hazard_stress: float = HAZARD_STRESS,
+    hazard_age: float = HAZARD_AGE,
+    hazard_intercept: float = HAZARD_INTERCEPT,
+):
     """Walk the fleet week by week, emitting telemetry and workshop events."""
     design_life = {p[0]: p[3] for p in PARTS}
     part_costs = {p[0]: (p[4], p[6]) for p in PARTS}
@@ -358,7 +378,7 @@ def simulate(rng: random.Random, vehicles: list[dict], weeks: list[date]):
                     for signal, weight in PLANTED_WEIGHTS[part_code].items()
                 )
                 hazard = sigmoid(
-                    HAZARD_STRESS * stress + HAZARD_AGE * age - HAZARD_INTERCEPT
+                    hazard_stress * stress + hazard_age * age - hazard_intercept
                 )
 
                 failed = False
@@ -484,8 +504,19 @@ def make_warranty_claims(
 
 
 def wipe(session) -> None:
-    """Clear generated data so the script is idempotent and re-runnable."""
+    """Clear generated data so the script is idempotent and re-runnable.
+
+    Order matters: everything scored or actioned on top of the old fleet has
+    to go before the fleet itself, or foreign keys refuse the delete. A new
+    fleet invalidates every prediction and rule derived from the old one.
+    """
     for model in (
+        WorkOrder,
+        Notification,
+        Prediction,
+        RuleSignal,
+        Rule,
+        AuditLog,
         WarrantyClaim,
         JobCard,
         TelematicsWeekly,
@@ -513,6 +544,12 @@ def main() -> int:
         default=None,
         help="Last observation week (YYYY-MM-DD). Defaults to this week.",
     )
+    # Exposed so the hazard model can be tuned against the spec's three
+    # simultaneous targets (failure count, precision band, signal recovery)
+    # without editing the module every time.
+    parser.add_argument("--hazard-stress", type=float, default=HAZARD_STRESS)
+    parser.add_argument("--hazard-age", type=float, default=HAZARD_AGE)
+    parser.add_argument("--hazard-intercept", type=float, default=HAZARD_INTERCEPT)
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -520,6 +557,7 @@ def main() -> int:
     weeks = [end_week - timedelta(weeks=N_WEEKS - 1 - i) for i in range(N_WEEKS)]
 
     print(f"Seed {args.seed}. Observation window {weeks[0]} to {weeks[-1]}.")
+    print(f"Hazard: stress {args.hazard_stress}, age {args.hazard_age}, intercept {args.hazard_intercept}.")
 
     customers = make_customers()
     users = make_users(customers)
@@ -538,7 +576,14 @@ def main() -> int:
     ]
 
     print(f"Simulating {len(vehicles)} vehicles x {len(parts)} components x {N_WEEKS} weeks...")
-    telematics_rows, job_cards, diagnostics = simulate(rng, vehicles, weeks)
+    telematics_rows, job_cards, diagnostics = simulate(
+        rng,
+        vehicles,
+        weeks,
+        hazard_stress=args.hazard_stress,
+        hazard_age=args.hazard_age,
+        hazard_intercept=args.hazard_intercept,
+    )
 
     vehicles_by_vin = {v["vin"]: v for v in vehicles}
     vehicle_rows = [

@@ -3,6 +3,8 @@
     python -m scripts.manage init-db            create schema, run migrations
     python -m scripts.manage seed [--if-empty]  generate the synthetic fleet
     python -m scripts.manage validate           check planted signal recovery
+    python -m scripts.manage score              deploy rules and score the fleet
+    python -m scripts.manage rebuild            init-db, seed, score, validate
 """
 
 from __future__ import annotations
@@ -60,6 +62,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return _run(command)
 
 
+def cmd_score(args: argparse.Namespace) -> int:
+    command = [sys.executable, "-m", "scripts.compute_predictions"]
+    if args.redeploy_rules:
+        command.append("--redeploy-rules")
+    return _run(command)
+
+
+def cmd_rebuild(args: argparse.Namespace) -> int:
+    """The full pipeline, in the order the README documents."""
+    steps = [
+        ("init-db", lambda: cmd_init_db(args)),
+        ("seed", lambda: cmd_seed(argparse.Namespace(if_empty=False, seed=None, end_date=None))),
+        ("score", lambda: cmd_score(argparse.Namespace(redeploy_rules=True))),
+        ("validate", lambda: cmd_validate(argparse.Namespace(target=None))),
+    ]
+    for name, step in steps:
+        log.info("rebuild step: %s", name)
+        code = step()
+        if code != 0:
+            log.error("rebuild failed at step: %s", name)
+            return code
+    return 0
+
+
 def main() -> int:
     configure_logging()
     parser = argparse.ArgumentParser(prog="manage", description=__doc__)
@@ -78,6 +104,14 @@ def main() -> int:
     validate_parser = subparsers.add_parser("validate", help="Check signal recovery.")
     validate_parser.add_argument("--target", type=float, default=None)
     validate_parser.set_defaults(handler=cmd_validate)
+
+    score_parser = subparsers.add_parser("score", help="Deploy rules and score the fleet.")
+    score_parser.add_argument("--redeploy-rules", action="store_true")
+    score_parser.set_defaults(handler=cmd_score)
+
+    subparsers.add_parser(
+        "rebuild", help="init-db, seed, score, validate - the whole pipeline."
+    ).set_defaults(handler=cmd_rebuild)
 
     args = parser.parse_args()
     return args.handler(args)
