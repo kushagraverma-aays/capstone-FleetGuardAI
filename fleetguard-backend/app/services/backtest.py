@@ -18,6 +18,21 @@ is what breaks the run. That distinction matters. Treating an episode as its
 start date alone either double-counts a long warning as several alerts
 (destroying precision) or pushes the only matchable date months before the
 failure (destroying coverage).
+
+**Right-censoring.** An episode is judged by whether a failure follows it
+inside the 90-day horizon. For an episode that ends within 90 days of the last
+week of data, that horizon runs off the end of the observation window: the
+failure it predicts may be perfectly real and simply not have happened yet.
+Counting those as false positives measures where the data stops, not how good
+the rule is - and it is a large effect here, because components at end of life
+are exactly the ones still alerting when the data runs out. Such episodes are
+therefore **excluded from precision entirely**, neither correct nor incorrect,
+which is the standard treatment of a censored observation.
+
+An episode that is already resolved is never censored: if the failure arrived,
+the outcome was observed and the episode counts, however close to the window
+edge it sits. Coverage needs no equivalent adjustment, because a failure that
+happened is observed by definition.
 """
 
 from __future__ import annotations
@@ -45,6 +60,7 @@ class BacktestResult:
     true_positive_episodes: int
     caught_failures: int
     alert_threshold: float
+    censored_episodes: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -59,6 +75,7 @@ EMPTY_RESULT = BacktestResult(
     true_positive_episodes=0,
     caught_failures=0,
     alert_threshold=RED_THRESHOLD,
+    censored_episodes=0,
 )
 
 
@@ -128,15 +145,21 @@ def backtest_rule(
     horizon = pd.Timedelta(days=horizon_days)
 
     # Precision: an episode is correct if a failure lands during the warning
-    # or inside the horizon after it stopped.
+    # or inside the horizon after it stopped. An unresolved episode whose
+    # horizon runs past the end of the data is censored, not counted wrong.
     total_episodes = 0
     true_positive_episodes = 0
+    censored_episodes = 0
     for vin, alert_dates in alerts_by_vin.items():
         vin_failures = failures_by_vin.get(vin, [])
         for start, end in collapse_to_episodes(alert_dates, episode_days):
-            total_episodes += 1
             if any(start <= failure <= end + horizon for failure in vin_failures):
+                total_episodes += 1
                 true_positive_episodes += 1
+            elif end + horizon > window_end:
+                censored_episodes += 1
+            else:
+                total_episodes += 1
 
     # Coverage: a failure is caught if any alert was raised inside the horizon
     # before it. Episode grouping is irrelevant here - the operator either got
@@ -166,4 +189,5 @@ def backtest_rule(
         true_positive_episodes=true_positive_episodes,
         caught_failures=caught_failures,
         alert_threshold=alert_threshold,
+        censored_episodes=censored_episodes,
     )

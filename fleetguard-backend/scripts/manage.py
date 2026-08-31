@@ -3,7 +3,7 @@
     python -m scripts.manage init-db            create schema, run migrations
     python -m scripts.manage seed [--if-empty]  generate the synthetic fleet
     python -m scripts.manage validate           check planted signal recovery
-    python -m scripts.manage score              deploy rules and score the fleet
+    python -m scripts.manage score [--if-empty] deploy rules and score the fleet
     python -m scripts.manage rebuild            init-db, seed, score, validate
 """
 
@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from app.config import BACKEND_ROOT
 from app.db import SessionLocal, ensure_database_exists
 from app.logging_config import configure_logging, get_logger
-from app.models import Vehicle
+from app.models import Prediction, Vehicle
 
 log = get_logger("fleetguard.cli")
 
@@ -62,7 +62,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return _run(command)
 
 
+def _prediction_count() -> int:
+    session = SessionLocal()
+    try:
+        return int(session.execute(select(func.count()).select_from(Prediction)).scalar_one())
+    finally:
+        session.close()
+
+
 def cmd_score(args: argparse.Namespace) -> int:
+    # --if-empty exists for container start-up: scoring the whole fleet takes
+    # about a minute, and repeating it on every restart of an already-scored
+    # database would delay the API coming up for no gain.
+    if getattr(args, "if_empty", False) and _prediction_count() > 0:
+        log.info("predictions already present, skipping scoring")
+        return 0
     command = [sys.executable, "-m", "scripts.compute_predictions"]
     if args.redeploy_rules:
         command.append("--redeploy-rules")
@@ -74,7 +88,7 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     steps = [
         ("init-db", lambda: cmd_init_db(args)),
         ("seed", lambda: cmd_seed(argparse.Namespace(if_empty=False, seed=None, end_date=None))),
-        ("score", lambda: cmd_score(argparse.Namespace(redeploy_rules=True))),
+        ("score", lambda: cmd_score(argparse.Namespace(redeploy_rules=True, if_empty=False))),
         ("validate", lambda: cmd_validate(argparse.Namespace(target=None))),
     ]
     for name, step in steps:
@@ -107,6 +121,9 @@ def main() -> int:
 
     score_parser = subparsers.add_parser("score", help="Deploy rules and score the fleet.")
     score_parser.add_argument("--redeploy-rules", action="store_true")
+    score_parser.add_argument(
+        "--if-empty", action="store_true", help="Skip if predictions already exist."
+    )
     score_parser.set_defaults(handler=cmd_score)
 
     subparsers.add_parser(

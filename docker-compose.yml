@@ -10,12 +10,18 @@ services:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
+    # -h 127.0.0.1 rather than localhost is deliberate: "localhost" makes the
+    # mysql client use a unix socket, which answers while the server is still
+    # running its bootstrap and not yet accepting TCP. The backend then starts,
+    # cannot connect over the network, and crash-loops until the restart policy
+    # happens to catch it at the right moment. Forcing TCP tests what the
+    # backend will actually use.
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD:-fleetguard}"]
-      interval: 10s
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_PASSWORD:-fleetguard}"]
+      interval: 5s
       timeout: 5s
-      retries: 12
-      start_period: 30s
+      retries: 24
+      start_period: 40s
 
   backend:
     build: ./fleetguard-backend
@@ -24,27 +30,41 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    # Picks up a local fleetguard-backend/.env when there is one, so the LLM key
+    # flows into the container for the assistant. Optional: a fresh clone with
+    # no .env still comes up on the defaults below.
+    env_file:
+      - path: ./fleetguard-backend/.env
+        required: false
     environment:
       MYSQL_HOST: mysql
       MYSQL_PORT: 3306
       MYSQL_USER: root
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-fleetguard}
       MYSQL_DB: ${MYSQL_DB:-fleetguard}
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      # Long enough to pass the startup strength check so a fresh stack comes up
+      # without a warning. It is a published demo value, not a secret: set
+      # JWT_SECRET in the environment for anything reachable from outside.
+      JWT_SECRET: ${JWT_SECRET:-demo-only-not-a-secret-rotate-before-any-real-deployment}
       AUTH_ENABLED: ${AUTH_ENABLED:-false}
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.groq.com/openai/v1}
-      LLM_MODEL: ${LLM_MODEL:-openai/gpt-oss-120b}
       CORS_ORIGINS: http://localhost:5173,http://localhost:3000
     ports:
       - "8000:8000"
-    # Migrate, then seed if the database is empty, then serve.
+    # Migrate, seed if empty, score if unscored, then serve. Scoring matters:
+    # without it the database has vehicles but no predictions, and every screen
+    # in the product comes up empty on a fresh stack.
     command: >
       sh -c "alembic upgrade head &&
              python -m scripts.manage seed --if-empty &&
+             python -m scripts.manage score --if-empty &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
+  # The frontend is built in phase 6. Until its directory exists, this service
+  # is behind a profile so `docker compose up` brings up the working stack
+  # rather than failing on a missing build context. Once fleetguard-frontend/
+  # is present, delete the `profiles` line and it joins the default stack.
   frontend:
+    profiles: ["frontend"]
     build: ./fleetguard-frontend
     container_name: fleetguard-frontend
     restart: unless-stopped

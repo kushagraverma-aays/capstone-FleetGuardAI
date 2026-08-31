@@ -126,6 +126,14 @@ class BacktestMetrics(ApiModel):
     true_positive_episodes: int
     caught_failures: int
     alert_threshold: float
+    censored_episodes: int = Field(
+        default=0,
+        description=(
+            "Alert episodes whose 90-day outcome window runs past the end of "
+            "the data. Excluded from precision because their outcome cannot "
+            "be observed yet, not because they were wrong."
+        ),
+    )
 
 
 class RuleOut(ApiModel):

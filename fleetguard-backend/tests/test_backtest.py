@@ -106,11 +106,18 @@ def test_an_alert_followed_by_a_failure_is_a_true_positive():
 
 
 def test_an_alert_with_no_failure_is_a_false_positive():
-    features = build_features({"VIN1": [1.0] * 10})
+    """The episode must have room to resolve, or it is censored rather than wrong.
+
+    Four alerting weeks followed by twenty quiet ones puts the end of the
+    episode well over 90 days before the end of the data, so its outcome was
+    genuinely observed: nothing failed.
+    """
+    features = build_features({"VIN1": [1.0] * 4 + [0.1] * 20})
     failures = pd.DataFrame(columns=["vin", "part_code", "event_date"])
     result = backtest_rule(features, failures, WEIGHTS)
     assert result.alert_episodes == 1
     assert result.true_positive_episodes == 0
+    assert result.censored_episodes == 0
     assert result.precision == 0.0
 
 
@@ -130,8 +137,11 @@ def test_a_failure_with_no_alert_hurts_coverage_but_not_precision():
 
 
 def test_precision_and_coverage_across_two_vehicles():
-    # VIN1 alerts and fails; VIN2 alerts and does not.
-    features = build_features({"VIN1": [1.0] * 10, "VIN2": [1.0] * 10})
+    # VIN1 alerts and fails; VIN2 alerts and does not. Both episodes end early
+    # enough in the record for their outcomes to have been observed.
+    features = build_features(
+        {"VIN1": [1.0] * 4 + [0.1] * 20, "VIN2": [1.0] * 4 + [0.1] * 20}
+    )
     failures = pd.DataFrame(
         {
             "vin": ["VIN1"],
@@ -142,6 +152,7 @@ def test_precision_and_coverage_across_two_vehicles():
     result = backtest_rule(features, failures, WEIGHTS)
     assert result.alert_episodes == 2
     assert result.true_positive_episodes == 1
+    assert result.censored_episodes == 0
     assert result.precision == pytest.approx(0.5)
     assert result.coverage == pytest.approx(1.0)
 
@@ -169,3 +180,73 @@ def test_a_rule_with_no_weights_raises_no_alerts():
     features = build_features({"VIN1": [1.0] * 10})
     failures = pd.DataFrame(columns=["vin", "part_code", "event_date"])
     assert backtest_rule(features, failures, {}).alert_episodes == 0
+
+
+# --- right-censoring (spec 6.4, applied to an observable population) ----------
+
+
+def test_an_unresolved_episode_at_the_window_edge_is_censored_not_wrong():
+    """The data stops before the 90-day horizon closes, so nothing is known.
+
+    Counting this as a false positive would measure where the dataset happens
+    to end rather than how good the rule is.
+    """
+    features = build_features({"VIN1": [1.0] * 10})
+    failures = pd.DataFrame(columns=["vin", "part_code", "event_date"])
+    result = backtest_rule(features, failures, WEIGHTS)
+
+    assert result.censored_episodes == 1
+    assert result.alert_episodes == 0
+    assert result.true_positive_episodes == 0
+    assert result.precision == 0.0
+
+
+def test_a_resolved_episode_at_the_window_edge_still_counts():
+    """Censoring applies to unknown outcomes only, never to observed ones."""
+    features = build_features({"VIN1": [1.0] * 10})
+    failures = pd.DataFrame(
+        {
+            "vin": ["VIN1"],
+            "part_code": ["TST-0001"],
+            "event_date": [pd.Timestamp("2025-03-03")],
+        }
+    )
+    result = backtest_rule(features, failures, WEIGHTS)
+
+    assert result.censored_episodes == 0
+    assert result.alert_episodes == 1
+    assert result.true_positive_episodes == 1
+    assert result.precision == pytest.approx(1.0)
+
+
+def test_censoring_never_inflates_precision_by_hiding_a_known_miss():
+    """A resolved miss and a censored episode must be counted differently.
+
+    VIN1's episode ends early and nothing follows it - an observed miss.
+    VIN2's episode runs to the end of the record - unknown. Precision must see
+    exactly one episode, and score it zero.
+    """
+    features = build_features(
+        {"VIN1": [1.0] * 4 + [0.1] * 20, "VIN2": [0.1] * 20 + [1.0] * 4}
+    )
+    failures = pd.DataFrame(columns=["vin", "part_code", "event_date"])
+    result = backtest_rule(features, failures, WEIGHTS)
+
+    assert result.alert_episodes == 1
+    assert result.censored_episodes == 1
+    assert result.precision == 0.0
+
+
+def test_censoring_does_not_touch_coverage():
+    """A failure that happened is observed by definition, censoring or not."""
+    features = build_features({"VIN1": [1.0] * 10})
+    failures = pd.DataFrame(
+        {
+            "vin": ["VIN1"],
+            "part_code": ["TST-0001"],
+            "event_date": [pd.Timestamp("2025-02-10")],
+        }
+    )
+    result = backtest_rule(features, failures, WEIGHTS)
+    assert result.coverage == pytest.approx(1.0)
+    assert result.caught_failures == 1

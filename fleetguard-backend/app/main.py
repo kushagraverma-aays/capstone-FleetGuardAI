@@ -15,17 +15,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from slowapi.errors import RateLimitExceeded
+
 from app.config import settings
 from app.db import ping
-from app.routers import auth, export, fleet, insights, rules, workflow
+from app.rate_limit import limiter, rate_limit_response
+from app.routers import auth, chat, export, fleet, insights, rules, workflow
 from app.logging_config import configure_logging, get_logger, new_request_id, request_id_var
+from app.services.llm import UpstreamLLMError
 
 configure_logging()
 log = get_logger("fleetguard.api")
-
-
-class UpstreamLLMError(RuntimeError):
-    """Raised when the LLM provider fails. Surfaces as 502 with its message."""
 
 
 # A stable machine-readable slug per status, so a client can branch on the
@@ -62,6 +62,11 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
         openapi_url="/openapi.json",
     )
+
+    # slowapi reads the limiter off app.state and needs its own handler for the
+    # 429, or the generic Exception handler would turn a rate limit into a 500.
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, rate_limit_response)
 
     app.add_middleware(
         CORSMiddleware,
@@ -175,6 +180,7 @@ def create_app() -> FastAPI:
     app.include_router(rules.router)
     app.include_router(workflow.router)
     app.include_router(export.router)
+    app.include_router(chat.router)
 
     @app.get("/api/health", tags=["system"], summary="Liveness probe")
     def health() -> dict:
