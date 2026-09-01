@@ -82,13 +82,39 @@ export default function RuleStudioPage() {
   const { data: scopeInfo } = useScopeInfo();
   const parts = useParts();
 
-  /** null means "the API's own default selection" - the suggested signals. */
+  /** null means "nothing chosen in this visit yet" - fall back to whatever is
+   *  already deployed, and only to the API's suggestion if nothing is. */
   const [signals, setSignals] = useState<string[] | null>(null);
+  const [ignoreDeployed, setIgnoreDeployed] = useState(false);
   const [confirming, setConfirming] = useState(false);
 
   // A different component is a different rule; carrying the previous
   // component's signal selection across would be meaningless.
-  useEffect(() => setSignals(null), [partCode]);
+  useEffect(() => {
+    setSignals(null);
+    setIgnoreDeployed(false);
+  }, [partCode]);
+
+  // Opening a component that already has a rule must show *that* rule, not the
+  // suggestion it was built from. Without this the wizard silently resets to
+  // the top-correlation default, so a four-signal rule you deployed yesterday
+  // reads as three signals today and looks like the deploy was lost.
+  const history = useRuleHistory(partCode ?? undefined);
+  const deployedSignals = useMemo(() => {
+    const active = history.data?.find((rule) => rule.is_active);
+    if (!active) return null;
+    const included = active.signals.filter((s) => s.included).map((s) => s.signal);
+    return included.length > 0 ? included : null;
+  }, [history.data]);
+
+  // Wait for the deployed rule before previewing, otherwise the first preview
+  // is computed from the suggestion and is immediately thrown away.
+  const historySettled = !partCode || history.isSuccess || history.isError;
+  const effectiveSignals = signals ?? (ignoreDeployed ? null : deployedSignals);
+  const deployedVersion = history.data?.find((rule) => rule.is_active)?.version;
+  // What the viewer is looking at, so the screen can say which it is.
+  const basis: "edited" | "deployed" | "suggested" =
+    signals !== null ? "edited" : effectiveSignals !== null ? "deployed" : "suggested";
 
   const setStep = (next: number, code = partCode) => {
     const params2 = new URLSearchParams();
@@ -97,7 +123,9 @@ export default function RuleStudioPage() {
     setParams(params2, { replace: false });
   };
 
-  const preview = useRulePreview(partCode ? { part_code: partCode, signals } : null);
+  const preview = useRulePreview(
+    partCode && historySettled ? { part_code: partCode, signals: effectiveSignals } : null,
+  );
   const deploy = useDeployRule();
 
   const selectedPart = parts.data?.find((part) => part.part_code === partCode);
@@ -171,6 +199,12 @@ export default function RuleStudioPage() {
             signals={signals}
             onSignalsChange={setSignals}
             preview={preview}
+            basis={basis}
+            deployedVersion={deployedVersion}
+            onUseSuggested={() => {
+              setSignals(null);
+              setIgnoreDeployed(true);
+            }}
             onNext={() => setStep(4)}
           />
         ) : (
@@ -547,12 +581,19 @@ function SignalStep({
   signals,
   onSignalsChange,
   preview,
+  basis,
+  deployedVersion,
+  onUseSuggested,
   onNext,
 }: {
   partCode: string;
   signals: string[] | null;
   onSignalsChange: (signals: string[] | null) => void;
   preview: PreviewQuery;
+  /** Where the selection on screen came from, so the card can say so. */
+  basis: "edited" | "deployed" | "suggested";
+  deployedVersion?: number;
+  onUseSuggested: () => void;
   onNext: () => void;
 }) {
   const correlations = usePartCorrelations(partCode);
@@ -684,6 +725,33 @@ function SignalStep({
                 {total.toFixed(2)}
               </span>
             </div>
+
+            {/* Which selection is on screen. Without this the wizard looks
+                identical whether it is showing your deployed rule or the
+                suggestion it was built from. */}
+            <p className="mt-1.5 text-[0.75rem] text-faint">
+              {basis === "deployed" ? (
+                <>
+                  Showing the deployed rule
+                  {deployedVersion ? ` (v${deployedVersion})` : ""}.{" "}
+                  <button
+                    type="button"
+                    onClick={onUseSuggested}
+                    className="text-accent underline underline-offset-2 transition-colors hover:text-accent-ink"
+                  >
+                    Start from the suggested signals instead
+                  </button>
+                </>
+              ) : basis === "suggested" ? (
+                deployedVersion ? (
+                  "Showing the suggested signals. Deploying replaces the rule that is live."
+                ) : (
+                  "Showing the suggested signals. No rule is deployed for this component yet."
+                )
+              ) : (
+                "Your selection. Nothing changes for the fleet until you deploy it."
+              )}
+            </p>
 
             {tooFew ? (
               <p className="mt-3 text-[0.8125rem] text-risk-amber">
