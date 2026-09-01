@@ -1,12 +1,37 @@
+# --- web framework ---
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# --- data layer ---
 SQLAlchemy==2.0.36
 PyMySQL==1.1.1
 cryptography==44.0.0
-python-dotenv==1.0.1
+alembic==1.14.0
+
+# --- config / validation ---
 pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# --- analytics ---
 pandas==2.2.3
 numpy==2.2.1
 scipy==1.15.0
 scikit-learn==1.6.0
-groq==0.13.1
+
+# --- auth ---
+passlib==1.7.4
+bcrypt==4.0.1
+PyJWT==2.10.1
+
+# --- llm (OpenAI-compatible client pointed at Groq) ---
+openai==1.59.6
+
+# --- ops ---
+python-json-logger==3.2.1
+slowapi==0.1.9
+
+# --- tests ---
+pytest==8.3.4
+httpx==0.28.1

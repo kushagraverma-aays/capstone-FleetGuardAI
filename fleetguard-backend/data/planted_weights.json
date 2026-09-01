@@ -1,31 +1,46 @@
 {
   "ELC-0152": {
-    "coolant_temp_variance": 0.28,
-    "overload_duty_share": 0.22,
-    "oil_pressure_dips": 0.2,
-    "dtc_recurrence_rate": 0.16,
-    "battery_voltage_sag": 0.14
+    "coolant_temp_variance": 0.26,
+    "overload_duty_share": 0.23,
+    "battery_voltage_sag": 0.2,
+    "oil_pressure_dips": 0.17,
+    "dtc_recurrence_rate": 0.14
   },
   "CLG-0311": {
-    "dtc_recurrence_rate": 0.3,
-    "high_rpm_dwell_time": 0.25,
-    "short_trip_ratio": 0.25,
+    "dtc_recurrence_rate": 0.31,
+    "high_rpm_dwell_time": 0.26,
+    "short_trip_ratio": 0.23,
     "harsh_braking_frequency": 0.2
   },
   "TRN-0207": {
-    "overload_duty_share": 0.35,
-    "high_rpm_dwell_time": 0.3,
-    "idle_time_pct": 0.2,
-    "coolant_temp_variance": 0.15
+    "overload_duty_share": 0.34,
+    "high_rpm_dwell_time": 0.28,
+    "idle_time_pct": 0.22,
+    "coolant_temp_variance": 0.16
   },
   "BRK-0104": {
-    "harsh_braking_frequency": 0.4,
-    "overload_duty_share": 0.3,
-    "short_trip_ratio": 0.3
+    "harsh_braking_frequency": 0.42,
+    "overload_duty_share": 0.31,
+    "short_trip_ratio": 0.27
   },
   "PWT-0455": {
-    "high_rpm_dwell_time": 0.35,
-    "coolant_temp_variance": 0.35,
-    "oil_pressure_dips": 0.3
+    "high_rpm_dwell_time": 0.38,
+    "coolant_temp_variance": 0.34,
+    "oil_pressure_dips": 0.28
+  },
+  "PWT-0620": {
+    "high_rpm_dwell_time": 0.4,
+    "oil_pressure_dips": 0.33,
+    "overload_duty_share": 0.27
+  },
+  "TRN-0388": {
+    "short_trip_ratio": 0.39,
+    "overload_duty_share": 0.32,
+    "harsh_braking_frequency": 0.29
+  },
+  "CLG-0145": {
+    "coolant_temp_variance": 0.41,
+    "dtc_recurrence_rate": 0.31,
+    "idle_time_pct": 0.28
   }
 }

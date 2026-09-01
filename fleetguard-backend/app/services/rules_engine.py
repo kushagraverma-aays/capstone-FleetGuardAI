@@ -1,204 +1,237 @@
+"""Rule builder, versioning and deployment (spec section 6.3).
+
+A rule is just a normalised set of signal weights for one component:
+
+    weight_i = correlation_i / sum(selected correlations)
+
+so the weights always sum to 1.00 and the resulting stress term stays on a
+0-1 scale, which is what lets the health index treat it as a percentage.
+
+Deploying a new rule deactivates the previous one rather than overwriting it.
+Keeping the history means a prediction made last month can still be explained
+by the rule that actually produced it.
+"""
+
 from __future__ import annotations
 
 import pandas as pd
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import (
-    BACKTEST_EPISODE_DAYS,
-    BACKTEST_LOOKBACK_DAYS,
-    DEFAULT_TOP_N_SIGNALS,
-    MIN_CORRELATION,
-    RED_THRESHOLD,
-    SIGNAL_LABELS,
-)
-from app.models import Rule, RuleSignal
-from app.services import engine as scoring
-from app.services.correlation import correlate_part
+from app.constants import DEFAULT_TOP_N_SIGNALS, MIN_CORRELATION, SIGNAL_LABELS
+from app.models import AuditLog, JobCard, Rule, RuleSignal
+from app.services.backtest import BacktestResult, backtest_rule
+from app.services.correlation import SignalCorrelation, rank_signals
 
 
-def normalise_weights(correlations: list[dict], selected: list[str]) -> list[dict]:
-    chosen = [c for c in correlations if c["signal"] in selected]
-    total = sum(c["correlation"] for c in chosen)
+def default_selection(correlations: list[SignalCorrelation]) -> list[str]:
+    """The signals the wizard pre-ticks: the strongest few that clear the floor."""
+    usable = [c for c in correlations if c.correlation >= MIN_CORRELATION]
+    return [c.signal for c in usable[:DEFAULT_TOP_N_SIGNALS]]
+
+
+def normalise_weights(
+    correlations: list[SignalCorrelation],
+    selected: list[str],
+) -> dict[str, float]:
+    """Turn correlations for the selected signals into weights summing to 1.00.
+
+    Rounding is done deliberately: the residual is folded into the largest
+    weight so the total is exactly 1.0 rather than 0.9999, because the UI
+    displays the sum and a user who sees 0.9999 stops trusting the number.
+    """
+    by_signal = {c.signal: c.correlation for c in correlations}
+    chosen = [s for s in selected if by_signal.get(s, 0.0) > 0.0]
+    if not chosen:
+        return {}
+
+    total = sum(by_signal[s] for s in chosen)
     if total <= 0:
-        share = 1.0 / max(len(chosen), 1)
-        return [{**c, "weight": round(share, 4)} for c in chosen]
-    return [{**c, "weight": round(c["correlation"] / total, 4)} for c in chosen]
+        return {}
+
+    weights = {s: round(by_signal[s] / total, 4) for s in chosen}
+    residual = round(1.0 - sum(weights.values()), 4)
+    if residual:
+        heaviest = max(weights, key=lambda s: weights[s])
+        weights[heaviest] = round(weights[heaviest] + residual, 4)
+    return dict(sorted(weights.items(), key=lambda kv: kv[1], reverse=True))
 
 
-def build_formula(weighted: list[dict]) -> str:
-    terms = " + ".join(f"{w['weight']:.2f} {w['signal']}" for w in weighted)
-    return f"failure_probability = {terms}"
+def format_formula(weights: dict[str, float]) -> str:
+    """Human-readable formula, e.g.
+
+    failure_probability = 0.28 coolant_temp_variance + 0.27 overload_duty_share
+    """
+    if not weights:
+        return "failure_probability = 0"
+    terms = [f"{weight:.2f} {signal}" for signal, weight in weights.items()]
+    return "failure_probability = " + " + ".join(terms)
 
 
-def backtest(features: pd.DataFrame, part_code: str, weights: dict[str, float]) -> dict:
-    part_df = features[features["part_code"] == part_code]
-    if part_df.empty:
-        return {"precision": 0.0, "coverage": 0.0, "days_to_alert": 0, "sample_failures": 0}
-
-    scored = scoring.score_frame(part_df, weights)
-    scored = scored.sort_values(["vin", "week_start_date"])
-
-    failures = scored.dropna(subset=["next_failure_date"])[["vin", "next_failure_date"]]
-    failures = failures.drop_duplicates()
-    total_failures = len(failures)
-
-    flagged = scored[scored["failure_probability"] >= RED_THRESHOLD].copy()
-    if flagged.empty or total_failures == 0:
-        return {
-            "precision": 0.0,
-            "coverage": 0.0,
-            "days_to_alert": 0,
-            "sample_failures": total_failures,
+def describe_weights(
+    weights: dict[str, float],
+    correlations: list[SignalCorrelation],
+) -> list[dict]:
+    """Weights plus their provenance, for the API and the Rule Studio."""
+    by_signal = {c.signal: c for c in correlations}
+    return [
+        {
+            "signal": signal,
+            "label": SIGNAL_LABELS.get(signal, signal),
+            "weight": weight,
+            "share": round(weight * 100, 1),
+            "correlation": by_signal[signal].correlation if signal in by_signal else 0.0,
         }
-
-    episodes = []
-    for vin, group in flagged.groupby("vin"):
-        last_kept = None
-        for row in group.sort_values("week_start_date").itertuples():
-            if last_kept is None or (row.week_start_date - last_kept).days > BACKTEST_EPISODE_DAYS:
-                episodes.append(row)
-                last_kept = row.week_start_date
-
-    true_positives = 0
-    caught = set()
-    lead_times = []
-    for ep in episodes:
-        if pd.isna(ep.next_failure_date):
-            continue
-        gap = (ep.next_failure_date - ep.week_start_date).days
-        if 0 <= gap <= BACKTEST_LOOKBACK_DAYS:
-            true_positives += 1
-            key = (ep.vin, ep.next_failure_date)
-            if key not in caught:
-                caught.add(key)
-                lead_times.append(gap)
-
-    precision = true_positives / len(episodes) if episodes else 0.0
-    coverage = len(caught) / total_failures if total_failures else 0.0
-    days_to_alert = int(pd.Series(lead_times).median()) if lead_times else 0
-
-    return {
-        "precision": round(precision, 4),
-        "coverage": round(coverage, 4),
-        "days_to_alert": days_to_alert,
-        "sample_failures": total_failures,
-    }
+        for signal, weight in weights.items()
+    ]
 
 
 def preview_rule(
-    features: pd.DataFrame, part_code: str, selected: list[str] | None = None
+    features: pd.DataFrame,
+    failures: pd.DataFrame,
+    part_code: str,
+    selected: list[str] | None = None,
 ) -> dict:
-    correlations = correlate_part(features, part_code)
+    """Recompute weights and back-test metrics without writing anything.
 
+    This is what the Rule Studio calls on every signal toggle, so it must stay
+    a pure computation over frames the caller already has.
+    """
+    part_features = features[features["part_code"] == part_code]
+    part_failures = failures[failures["part_code"] == part_code]
+
+    correlations = rank_signals(part_features)
     if selected is None:
-        selected = [
-            c["signal"] for c in correlations if c["correlation"] >= MIN_CORRELATION
-        ][:DEFAULT_TOP_N_SIGNALS]
-    if not selected:
-        selected = [correlations[0]["signal"]]
+        selected = default_selection(correlations)
 
-    weighted = normalise_weights(correlations, selected)
-    weights = {w["signal"]: w["weight"] for w in weighted}
-    metrics = backtest(features, part_code, weights)
+    weights = normalise_weights(correlations, selected)
+    metrics = (
+        backtest_rule(part_features, part_failures, weights)
+        if weights
+        else BacktestResult(0.0, 0.0, 0.0, 0, 0, 0, 0, 0.0)
+    )
 
     return {
         "part_code": part_code,
-        "formula": build_formula(weighted),
-        "signals": [
-            {
-                "signal": w["signal"],
-                "label": SIGNAL_LABELS.get(w["signal"], w["signal"]),
-                "correlation": w["correlation"],
-                "correlation_pct": w["correlation_pct"],
-                "weight": w["weight"],
-                "included": True,
-            }
-            for w in weighted
-        ],
-        "excluded": [
-            {
-                "signal": c["signal"],
-                "label": c["label"],
-                "correlation": c["correlation"],
-                "correlation_pct": c["correlation_pct"],
-                "weight": 0.0,
-                "included": False,
-            }
-            for c in correlations
-            if c["signal"] not in selected
-        ],
-        **metrics,
+        "selected_signals": list(weights.keys()),
+        "weights": describe_weights(weights, correlations),
+        "formula": format_formula(weights),
+        "correlations": [c.to_dict() for c in correlations],
+        "metrics": metrics.to_dict(),
     }
 
 
-def save_rule(db: Session, preview: dict) -> Rule:
-    db.execute(
-        update(Rule)
-        .where(Rule.part_code == preview["part_code"], Rule.is_active == True)  # noqa: E712
-        .values(is_active=False)
+def active_rule(session: Session, part_code: str) -> Rule | None:
+    return session.execute(
+        select(Rule)
+        .where(Rule.part_code == part_code, Rule.is_active.is_(True))
+        .order_by(Rule.version.desc())
+    ).scalars().first()
+
+
+def rule_history(session: Session, part_code: str) -> list[Rule]:
+    return list(
+        session.execute(
+            select(Rule).where(Rule.part_code == part_code).order_by(Rule.version.desc())
+        ).scalars()
+    )
+
+
+def rule_weights(session: Session, rule: Rule) -> dict[str, float]:
+    """The included signal weights of a persisted rule."""
+    rows = session.execute(
+        select(RuleSignal.signal, RuleSignal.weight).where(
+            RuleSignal.rule_id == rule.rule_id, RuleSignal.included.is_(True)
+        )
+    ).all()
+    return {signal: float(weight) for signal, weight in rows}
+
+
+def deploy_rule(
+    session: Session,
+    features: pd.DataFrame,
+    failures: pd.DataFrame,
+    part_code: str,
+    selected: list[str] | None = None,
+    created_by: str = "system",
+    user_id: int | None = None,
+) -> Rule:
+    """Persist a new rule version and retire the previous one."""
+    preview = preview_rule(features, failures, part_code, selected)
+    weights = {w["signal"]: w["weight"] for w in preview["weights"]}
+    correlations = {c["signal"]: c["correlation"] for c in preview["correlations"]}
+    metrics = preview["metrics"]
+
+    previous = active_rule(session, part_code)
+    if previous is not None:
+        previous.is_active = False
+
+    next_version = 1 + (
+        session.execute(
+            select(Rule.version)
+            .where(Rule.part_code == part_code)
+            .order_by(Rule.version.desc())
+        ).scalars().first()
+        or 0
     )
 
     rule = Rule(
-        part_code=preview["part_code"],
+        part_code=part_code,
+        version=next_version,
         formula=preview["formula"],
-        precision=preview["precision"],
-        coverage=preview["coverage"],
-        days_to_alert=preview["days_to_alert"],
-        sample_failures=preview["sample_failures"],
+        precision=metrics["precision"],
+        coverage=metrics["coverage"],
+        days_to_alert=metrics["days_to_alert"],
+        sample_failures=metrics["sample_failures"],
         is_active=True,
+        created_by=created_by,
     )
-    db.add(rule)
-    db.flush()
+    session.add(rule)
+    session.flush()
 
-    for s in preview["signals"]:
-        db.add(
+    # Signals the user turned off are recorded too, with included=False, so the
+    # modelling choice remains auditable after the fact.
+    for signal, correlation in correlations.items():
+        session.add(
             RuleSignal(
                 rule_id=rule.rule_id,
-                signal=s["signal"],
-                correlation=s["correlation"],
-                weight=s["weight"],
-                included=True,
+                signal=signal,
+                correlation=correlation,
+                weight=weights.get(signal, 0.0),
+                included=signal in weights,
             )
         )
-    db.commit()
-    db.refresh(rule)
+
+    session.add(
+        AuditLog(
+            user_id=user_id,
+            action="rule.deploy",
+            entity="rule",
+            entity_id=str(rule.rule_id),
+            payload={
+                "part_code": part_code,
+                "version": next_version,
+                "formula": preview["formula"],
+                "weights": weights,
+                "metrics": metrics,
+                "replaced_rule_id": previous.rule_id if previous else None,
+            },
+        )
+    )
+    session.commit()
     return rule
 
 
-def active_rule(db: Session, part_code: str) -> Rule | None:
-    return db.execute(
-        select(Rule).where(Rule.part_code == part_code, Rule.is_active == True)  # noqa: E712
-    ).scalar_one_or_none()
-
-
-def rule_weights(db: Session, rule: Rule) -> dict[str, float]:
-    rows = db.execute(
-        select(RuleSignal).where(RuleSignal.rule_id == rule.rule_id, RuleSignal.included == True)  # noqa: E712
-    ).scalars().all()
-    return {r.signal: r.weight for r in rows}
-
-
-def rule_to_dict(db: Session, rule: Rule) -> dict:
-    rows = db.execute(select(RuleSignal).where(RuleSignal.rule_id == rule.rule_id)).scalars().all()
-    return {
-        "rule_id": rule.rule_id,
-        "part_code": rule.part_code,
-        "formula": rule.formula,
-        "precision": rule.precision,
-        "coverage": rule.coverage,
-        "days_to_alert": rule.days_to_alert,
-        "sample_failures": rule.sample_failures,
-        "created_at": rule.created_at.isoformat() if rule.created_at else None,
-        "signals": [
-            {
-                "signal": r.signal,
-                "label": SIGNAL_LABELS.get(r.signal, r.signal),
-                "correlation": r.correlation,
-                "correlation_pct": round(r.correlation * 100, 1),
-                "weight": r.weight,
-                "included": r.included,
-            }
-            for r in rows
-        ],
-    }
+def load_failures(session: Session) -> pd.DataFrame:
+    """Failure events only - the ground truth the back-test scores against."""
+    frame = pd.DataFrame(
+        session.execute(
+            select(JobCard.vin, JobCard.part_code, JobCard.event_date).where(
+                JobCard.event_type == "failure"
+            )
+        ).all(),
+        columns=["vin", "part_code", "event_date"],
+    )
+    if not frame.empty:
+        frame["event_date"] = pd.to_datetime(frame["event_date"])
+    return frame

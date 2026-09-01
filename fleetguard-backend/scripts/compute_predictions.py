@@ -1,177 +1,325 @@
+"""Scoring pipeline: features -> rules -> predictions -> notifications.
+
+Idempotent and re-runnable. Deploys a default rule for any component that does
+not have one yet, scores every (vehicle, component) pair from the deployed
+rule, and writes one prediction row each.
+
+Run:  python -m scripts.compute_predictions [--redeploy-rules]
+"""
+
 from __future__ import annotations
 
 import argparse
 from datetime import date
 
-from sqlalchemy import delete, insert, select
+import numpy as np
+import pandas as pd
+from sqlalchemy import delete, func, select
 
-from app.db import SessionLocal, engine
-from app.models import Notification, Part, Prediction
-from app.services import engine as scoring
-from app.services import features
-from app.services.rules_engine import active_rule, preview_rule, rule_weights, save_rule
-
-NOTIFY_MAX_DAYS = 45
-
-
-def ensure_rules(db, feats) -> dict[str, tuple[int, dict]]:
-    out = {}
-    parts = db.execute(select(Part)).scalars().all()
-    for part in parts:
-        rule = active_rule(db, part.part_code)
-        if rule is None:
-            preview = preview_rule(feats, part.part_code)
-            rule = save_rule(db, preview)
-            print(f"  built default rule for {part.part_code}: {rule.formula}")
-        out[part.part_code] = (rule.rule_id, rule_weights(db, rule))
-    return out
+from app.constants import (
+    SIGNAL_LABELS,
+    TREND_WEEKS,
+    WEIGHT_AGE,
+    WEIGHT_STRESS,
+)
+from app.db import SessionLocal
+from app.models import JobCard, Notification, Part, Prediction, Vehicle
+from app.services import rules_engine
+from app.services.cost import estimate_cost_impact
+from app.services.features import build_feature_table
+from app.services.rul import estimate_rul
+from app.services.scoring import assess
 
 
-def build_rows(feats, parts_meta, rules) -> list[dict]:
-    today = date.today()
-    rows = []
+def ensure_rules(session, features, failures, redeploy: bool) -> dict[str, dict]:
+    """Every component needs a deployed rule before anything can be scored."""
+    parts = session.execute(select(Part.part_code, Part.part_name)).all()
+    deployed: dict[str, dict] = {}
 
-    for part_code, (rule_id, weights) in rules.items():
-        if not weights:
-            continue
-        part_df = feats[feats["part_code"] == part_code]
-        if part_df.empty:
-            continue
-
-        scored = scoring.score_frame(part_df, weights).sort_values(["vin", "week_start_date"])
-        design_life = float(parts_meta[part_code])
-
-        for vin, history in scored.groupby("vin", sort=False):
-            history = history.sort_values("week_start_date")
-            last = history.iloc[-1]
-
-            rul = scoring.estimate_rul(history, design_life, float(last["avg_km_per_day"]))
-            drivers = scoring.drivers_for_row(last, weights)
-            trend = scoring.probability_trend(history)
-            probability = float(last["failure_probability"])
-            window_from, window_to = scoring.failure_window(rul["rul_days"])
-
-            rows.append(
-                {
-                    "vin": vin,
-                    "part_code": part_code,
-                    "rule_id": rule_id,
-                    "failure_probability": round(probability, 4),
-                    "risk_tier": scoring.risk_tier(probability, rul["rul_days"]),
-                    "health_index": rul["health_index"],
-                    "window_from_days": window_from,
-                    "window_to_days": window_to,
-                    "rul_km": rul["rul_km"],
-                    "rul_days": rul["rul_days"],
-                    "model_confidence": rul["model_confidence"],
-                    "degradation_trend": rul["degradation_trend"],
-                    "top_signal": drivers[0]["signal"] if drivers else "",
-                    "top_signal_share": drivers[0]["share"] if drivers else 0.0,
-                    "drivers": drivers,
-                    "trend": trend,
-                    "curve": rul["curve"],
-                    "computed_date": today,
-                }
+    for part_code, part_name in parts:
+        rule = rules_engine.active_rule(session, part_code)
+        if rule is None or redeploy:
+            rule = rules_engine.deploy_rule(
+                session, features, failures, part_code, created_by="system"
             )
+            print(
+                f"  deployed {part_name:<20} v{rule.version}  "
+                f"precision {rule.precision:.0%}  coverage {rule.coverage:.0%}  "
+                f"lead {rule.days_to_alert:.0f}d"
+            )
+        weights = rules_engine.rule_weights(session, rule)
+        deployed[part_code] = {"rule": rule, "weights": weights}
+
+    return deployed
+
+
+def median_downtime_by_part(session) -> dict[str, float]:
+    """Observed downtime for real failures, used for the cost model."""
+    rows = session.execute(
+        select(JobCard.part_code, func.avg(JobCard.downtime_hours))
+        .where(JobCard.event_type == "failure")
+        .group_by(JobCard.part_code)
+    ).all()
+    return {code: float(hours) for code, hours in rows if hours is not None}
+
+
+def build_drivers(signals: dict[str, float], weights: dict[str, float]) -> list[dict]:
+    """Per-signal contribution to this component's stress term."""
+    contributions = {
+        signal: weight * float(signals.get(signal, 0.0))
+        for signal, weight in weights.items()
+    }
+    total = sum(contributions.values())
+    drivers = [
+        {
+            "signal": signal,
+            "label": SIGNAL_LABELS.get(signal, signal),
+            "value": round(float(signals.get(signal, 0.0)), 4),
+            "weight": round(weights[signal], 4),
+            "contribution": round(contribution, 5),
+            "share": round(contribution / total * 100, 1) if total else 0.0,
+        }
+        for signal, contribution in contributions.items()
+    ]
+    drivers.sort(key=lambda d: d["contribution"], reverse=True)
+    return drivers
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Score the fleet.")
+    parser.add_argument(
+        "--redeploy-rules",
+        action="store_true",
+        help="Deploy a fresh rule version for every component before scoring.",
+    )
+    args = parser.parse_args()
+
+    session = SessionLocal()
+    try:
+        print("Building feature table...")
+        features = build_feature_table(session)
+        if features.empty:
+            raise SystemExit("No features. Run 'python -m scripts.manage seed' first.")
+        failures = rules_engine.load_failures(session)
+
+        print("Ensuring deployed rules...")
+        deployed = ensure_rules(session, features, failures, args.redeploy_rules)
+
+        vehicles = {
+            vin: {"avg_km_per_day": km, "customer_id": customer_id}
+            for vin, km, customer_id in session.execute(
+                select(Vehicle.vin, Vehicle.avg_km_per_day, Vehicle.customer_id)
+            ).all()
+        }
+        parts = {
+            code: {
+                "name": name,
+                "design_life_km": life,
+                "unit_cost": float(cost),
+                "labour_hours": float(labour),
+                "lead_time_days": lead,
+            }
+            for code, name, life, cost, labour, lead in session.execute(
+                select(
+                    Part.part_code,
+                    Part.part_name,
+                    Part.design_life_km,
+                    Part.unit_cost,
+                    Part.labour_hours,
+                    Part.lead_time_days,
+                )
+            ).all()
+        }
+        downtime = median_downtime_by_part(session)
+
+        today = date.today()
+        prediction_rows: list[dict] = []
+
+        print("Scoring vehicles...")
+        for part_code, meta in deployed.items():
+            weights = meta["weights"]
+            rule = meta["rule"]
+            part = parts[part_code]
+
+            frame = features[features["part_code"] == part_code].sort_values(
+                ["vin", "week_start_date"]
+            )
+            if frame.empty or not weights:
+                continue
+
+            # Health index for every week, vectorised: the same formula as
+            # scoring.assess(), applied to the whole component at once.
+            stress = np.zeros(len(frame), dtype=float)
+            for signal, weight in weights.items():
+                stress = stress + weight * frame[signal].to_numpy(dtype=float)
+            age = frame["age_fraction"].to_numpy(dtype=float)
+            frame = frame.assign(
+                stress=stress,
+                health_index=np.clip(
+                    100.0 - WEIGHT_AGE * age - WEIGHT_STRESS * stress, 0.0, 100.0
+                ),
+            )
+
+            for vin, history in frame.groupby("vin", sort=False):
+                vehicle = vehicles.get(vin)
+                if vehicle is None:
+                    continue
+
+                latest = history.iloc[-1]
+                rul = estimate_rul(
+                    history[["km_on_part", "health_index"]],
+                    design_life_km=part["design_life_km"],
+                    avg_km_per_day=vehicle["avg_km_per_day"],
+                )
+
+                risk = assess(
+                    age_fraction=float(latest["age_fraction"]),
+                    stress=float(latest["stress"]),
+                    rul_days=rul.rul_days,
+                )
+
+                signals = {s: float(latest[s]) for s in weights}
+                drivers = build_drivers(signals, weights)
+                top = drivers[0] if drivers else None
+
+                trend = [
+                    {
+                        "week": row.week_start_date.date().isoformat(),
+                        "probability": round(1.0 - row.health_index / 100.0, 4),
+                        "health_index": round(float(row.health_index), 2),
+                    }
+                    for row in history.tail(TREND_WEEKS).itertuples()
+                ]
+
+                cost = estimate_cost_impact(
+                    unit_cost=part["unit_cost"],
+                    labour_hours=part["labour_hours"],
+                    failure_probability=risk.failure_probability,
+                    downtime_hours=downtime.get(part_code),
+                )
+
+                # A window rather than a single date: confidence widens it.
+                spread = max(0.15, 1.0 - rul.model_confidence) * 0.5
+                prediction_rows.append(
+                    {
+                        "vin": vin,
+                        "part_code": part_code,
+                        "rule_id": rule.rule_id,
+                        "failure_probability": risk.failure_probability,
+                        "risk_tier": risk.risk_tier,
+                        "health_index": risk.health_index,
+                        "window_from_days": int(max(0, rul.rul_days * (1 - spread))),
+                        "window_to_days": int(rul.rul_days * (1 + spread)),
+                        "rul_km": rul.rul_km,
+                        "rul_days": rul.rul_days,
+                        "model_confidence": rul.model_confidence,
+                        "degradation_trend": rul.degradation_trend,
+                        "top_signal": top["signal"] if top else None,
+                        "top_signal_share": top["share"] if top else 0.0,
+                        "escalated": risk.escalated,
+                        "escalation_reason": risk.escalation_reason,
+                        "drivers": drivers,
+                        "trend": trend,
+                        "curve": rul.curve,
+                        "estimated_cost_impact": cost.estimated_cost_impact,
+                        "computed_date": today,
+                    }
+                )
+
+        print(f"Writing {len(prediction_rows):,} predictions...")
+        session.execute(delete(Prediction))
+        for start in range(0, len(prediction_rows), 1000):
+            session.bulk_insert_mappings(Prediction, prediction_rows[start : start + 1000])
+        session.commit()
+
+        notifications = build_notifications(prediction_rows, vehicles, parts)
+        print(f"Writing {len(notifications):,} pending notifications...")
+        session.execute(delete(Notification).where(Notification.status == "pending"))
+        for start in range(0, len(notifications), 1000):
+            session.bulk_insert_mappings(Notification, notifications[start : start + 1000])
+        session.commit()
+
+        summarise(prediction_rows)
+    finally:
+        session.close()
+    return 0
+
+
+def build_notifications(
+    predictions: list[dict],
+    vehicles: dict,
+    parts: dict,
+) -> list[dict]:
+    """One vendor alert and one fleet-owner alert per RED component.
+
+    The two audiences need different things: the vendor needs to move stock
+    against a lead time, the operator needs to book a slot and a driver.
+    """
+    rows: list[dict] = []
+    for prediction in predictions:
+        if prediction["risk_tier"] != "RED":
+            continue
+        vin = prediction["vin"]
+        part = parts[prediction["part_code"]]
+        customer_id = vehicles[vin]["customer_id"]
+        rul_days = prediction["rul_days"]
+        probability = prediction["failure_probability"]
+        severity = "critical" if prediction["escalated"] or rul_days <= 14 else "high"
+
+        rows.append(
+            {
+                "vin": vin,
+                "part_code": prediction["part_code"],
+                "customer_id": customer_id,
+                "audience": "vendor",
+                "severity": severity,
+                "title": f"Stock {part['name']} for {vin}",
+                "message": (
+                    f"{part['name']} on {vin} is at {probability:.0%} failure "
+                    f"probability with {rul_days:.0f} days of useful life left. "
+                    f"Lead time is {part['lead_time_days']} days, so the part "
+                    f"needs to be committed now to arrive before the window closes."
+                ),
+                "status": "pending",
+            }
+        )
+        rows.append(
+            {
+                "vin": vin,
+                "part_code": prediction["part_code"],
+                "customer_id": customer_id,
+                "audience": "fleet_owner",
+                "severity": severity,
+                "title": f"Book {vin} for {part['name']} replacement",
+                "message": (
+                    f"{vin} is projected to lose its {part['name']} within "
+                    f"{rul_days:.0f} days ({probability:.0%} probability). "
+                    f"Replacing on plan avoids an estimated "
+                    f"{prediction['estimated_cost_impact']:,.0f} in recovery, "
+                    f"downtime and premium-parts cost."
+                ),
+                "status": "pending",
+            }
+        )
     return rows
 
 
-def build_notifications(rows, parts_meta_names) -> list[dict]:
-    out = []
-    for r in rows:
-        if r["risk_tier"] != "RED" or r["rul_days"] > NOTIFY_MAX_DAYS:
-            continue
-        name = parts_meta_names.get(r["part_code"], r["part_code"])
-        out.append(
-            {
-                "vin": r["vin"],
-                "part_code": r["part_code"],
-                "audience": "vendor",
-                "severity": "RED",
-                "message": (
-                    f"Pre-position {name} for {r['vin']}: failure probability "
-                    f"{r['failure_probability']:.0%}, approximately {r['rul_days']} days of "
-                    f"useful life remaining."
-                ),
-                "status": "pending",
-            }
-        )
-        out.append(
-            {
-                "vin": r["vin"],
-                "part_code": r["part_code"],
-                "audience": "fleet_owner",
-                "severity": "RED",
-                "message": (
-                    f"{r['vin']} requires a workshop slot within {r['window_from_days']}-"
-                    f"{r['window_to_days']} days for {name}."
-                ),
-                "status": "pending",
-            }
-        )
-    return out
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--rebuild-rules", action="store_true")
-    args = parser.parse_args()
-
-    features.invalidate_cache()
-    print("building feature table ...")
-    feats = features.build_features(engine)
-    if feats.empty:
-        print("[error] no data. run: python -m scripts.generate_data")
+def summarise(predictions: list[dict]) -> None:
+    frame = pd.DataFrame(predictions)
+    if frame.empty:
+        print("No predictions written.")
         return
 
-    db = SessionLocal()
-    try:
-        parts = db.execute(select(Part)).scalars().all()
-        parts_meta = {p.part_code: p.design_life_km for p in parts}
-        parts_names = {p.part_code: p.part_name for p in parts}
-
-        if args.rebuild_rules:
-            from app.models import Rule, RuleSignal
-
-            db.execute(delete(RuleSignal))
-            db.execute(delete(Rule))
-            db.commit()
-            print("[ok] existing rules cleared")
-
-        print("ensuring active rules ...")
-        rules = ensure_rules(db, feats)
-
-        print("scoring fleet ...")
-        rows = build_rows(feats, parts_meta, rules)
-
-        db.execute(delete(Prediction))
-        db.execute(delete(Notification))
-        db.commit()
-
-        for i in range(0, len(rows), 500):
-            db.execute(insert(Prediction), rows[i : i + 500])
-        db.commit()
-
-        notes = build_notifications(rows, parts_names)
-        for i in range(0, len(notes), 500):
-            db.execute(insert(Notification), notes[i : i + 500])
-        db.commit()
-
-        tiers = {"RED": 0, "AMBER": 0, "GREEN": 0}
-        for r in rows:
-            tiers[r["risk_tier"]] += 1
-        urgent = sum(1 for r in rows if r["rul_days"] <= 30)
-
-        print(f"[ok] predictions       {len(rows):>6}")
-        print(f"       RED             {tiers['RED']:>6}")
-        print(f"       AMBER           {tiers['AMBER']:>6}")
-        print(f"       GREEN           {tiers['GREEN']:>6}")
-        print(f"[ok] inside 30-day RUL {urgent:>6}")
-        print(f"[ok] notifications     {len(notes):>6}")
-        print("\nNext:  uvicorn app.main:app --reload")
-    finally:
-        db.close()
+    tiers = frame["risk_tier"].value_counts().to_dict()
+    print()
+    print("Predictions:")
+    for tier in ("RED", "AMBER", "GREEN"):
+        print(f"  {tier:<6} {tiers.get(tier, 0):>6}")
+    print(f"  escalated by RUL     {int(frame['escalated'].sum()):>6}")
+    print(f"  inside 30-day RUL    {int((frame['rul_days'] <= 30).sum()):>6}")
+    print(f"  mean confidence      {frame['model_confidence'].mean():>6.2f}")
+    print(f"  total cost exposure  {frame['estimated_cost_impact'].sum():>12,.0f}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
