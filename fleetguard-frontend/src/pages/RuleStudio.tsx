@@ -944,39 +944,151 @@ function RuleHistory({
         ))}
       </ul>
 
-      {comparing && activeRule ? (
-        <div className="rounded-card border border-hairline p-3.5">
-          <h4 className="text-[0.8125rem] font-medium text-ink">
-            v{comparing.version} against v{activeRule.version}
-          </h4>
-          <ul className="mt-2.5 space-y-1.5">
-            {signalDiff(activeRule, comparing).map((row) => (
-              <li key={row.signal} className="flex items-baseline justify-between gap-3 text-[0.8125rem]">
-                <span className="truncate text-ink">{row.label}</span>
-                <span className="tabular shrink-0 text-muted">
-                  {row.before === null ? "not used" : row.before.toFixed(3)} {"->"}{" "}
-                  {row.after === null ? "not used" : row.after.toFixed(3)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+      {comparing && activeRule ? <RuleComparison a={comparing} b={activeRule} /> : null}
     </div>
   );
 }
 
-function signalDiff(active: RuleOut, other: RuleOut) {
-  const bySignal = new Map<string, { label: string; before: number | null; after: number | null }>();
-  for (const signal of active.signals) {
-    bySignal.set(signal.signal, { label: signal.label, before: signal.weight, after: null });
+/**
+ * Two rule versions side by side: what the change did to the metrics, and
+ * which signal weights moved.
+ *
+ * Always drawn oldest-to-newest whichever row was clicked, because "before ->
+ * after" only means anything in chronological order. The metrics are the point
+ * - a signal diff on its own says what changed but not whether it helped, and
+ * the card above promises that comparing is how a change gets justified.
+ */
+function RuleComparison({ a, b }: { a: RuleOut; b: RuleOut }) {
+  const [older, newer] = a.version <= b.version ? [a, b] : [b, a];
+
+  // More warning time is better, same as more precision and more coverage, so
+  // every row here improves upwards.
+  const rows = [
+    {
+      label: "Precision",
+      before: formatPercent(older.precision),
+      after: formatPercent(newer.precision),
+      delta: (newer.precision - older.precision) * 100,
+      unit: "pp",
+    },
+    {
+      label: "Coverage",
+      before: formatPercent(older.coverage),
+      after: formatPercent(newer.coverage),
+      delta: (newer.coverage - older.coverage) * 100,
+      unit: "pp",
+    },
+    {
+      label: "Warning time",
+      before: `${Math.round(older.days_to_alert)} days`,
+      after: `${Math.round(newer.days_to_alert)} days`,
+      delta: newer.days_to_alert - older.days_to_alert,
+      unit: " days",
+    },
+  ];
+
+  const signals = signalDiff(older, newer);
+  const metricsMoved = rows.some((row) => Math.abs(row.delta) >= 0.05);
+
+  return (
+    <div className="rounded-card border border-hairline p-3.5">
+      <h4 className="text-[0.8125rem] font-medium text-ink">
+        v{older.version} to v{newer.version}
+      </h4>
+      <p className="mt-1 text-[0.75rem] text-faint">
+        Both back-tested over the same twelve months of history for this component.
+      </p>
+
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full text-[0.8125rem]">
+          <thead>
+            <tr className="text-left text-[0.6875rem] uppercase tracking-wider text-faint">
+              <th className="pb-1.5 font-medium">Metric</th>
+              <th className="pb-1.5 text-right font-medium">v{older.version}</th>
+              <th className="pb-1.5 text-right font-medium">v{newer.version}</th>
+              <th className="pb-1.5 text-right font-medium">Change</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const flat = Math.abs(row.delta) < 0.05;
+              return (
+                <tr key={row.label} className="border-t border-hairline">
+                  <td className="py-1.5 text-ink">{row.label}</td>
+                  <td className="tabular py-1.5 text-right text-muted">{row.before}</td>
+                  <td className="tabular py-1.5 text-right text-ink">{row.after}</td>
+                  <td
+                    className={cn(
+                      "tabular py-1.5 text-right font-medium",
+                      flat ? "text-faint" : row.delta > 0 ? "text-risk-green" : "text-risk-red",
+                    )}
+                  >
+                    {flat
+                      ? "no change"
+                      : `${row.delta > 0 ? "+" : "−"}${Math.abs(row.delta).toFixed(1)}${row.unit}`}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {signals.length === 0 ? (
+        <p className="mt-3 text-[0.8125rem] text-muted">
+          {metricsMoved
+            ? "The same signals at the same weights, so the metrics above are the only difference."
+            : "Identical rules. Only the version number, who deployed it and when differ."}
+        </p>
+      ) : (
+        <ul className="mt-3 space-y-1.5 border-t border-hairline pt-3">
+          {signals.map((row) => (
+            <li
+              key={row.signal}
+              className="flex items-baseline justify-between gap-3 text-[0.8125rem]"
+            >
+              <span className="truncate text-ink">{row.label}</span>
+              <span className="tabular shrink-0 text-muted">
+                {row.before === null ? "not used" : row.before.toFixed(3)} {"->"}{" "}
+                {row.after === null ? "not used" : row.after.toFixed(3)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Weight changes between two versions, oldest first.
+ *
+ * A rule row carries every signal, including the ones the author turned off, so
+ * an unfiltered diff is mostly "0.000 -> 0.000". A signal unused in both
+ * versions is not part of the change and is dropped; a weight of zero is
+ * reported as "not used" rather than as a number, because that is what it means.
+ */
+function signalDiff(older: RuleOut, newer: RuleOut) {
+  const weight = (rule: RuleOut, signal: string): number | null => {
+    const found = rule.signals.find((s) => s.signal === signal);
+    if (!found || !found.included || found.weight === 0) return null;
+    return found.weight;
+  };
+
+  const names = new Map<string, string>();
+  for (const signal of [...older.signals, ...newer.signals]) {
+    names.set(signal.signal, signal.label);
   }
-  for (const signal of other.signals) {
-    const existing = bySignal.get(signal.signal);
-    if (existing) existing.after = signal.weight;
-    else bySignal.set(signal.signal, { label: signal.label, before: null, after: signal.weight });
-  }
-  return [...bySignal.entries()].map(([signal, row]) => ({ signal, ...row }));
+
+  return [...names.entries()]
+    .map(([signal, label]) => ({
+      signal,
+      label,
+      before: weight(older, signal),
+      after: weight(newer, signal),
+    }))
+    .filter((row) => row.before !== null || row.after !== null)
+    .filter((row) => row.before !== row.after);
 }
 
 // --- shared bits -------------------------------------------------------------
