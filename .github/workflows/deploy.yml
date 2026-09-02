@@ -1,0 +1,54 @@
+name: Deploy to Databricks
+on:
+  push:
+    branches: [ main ]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '18' }
+      - run: |
+          # 1. Refresh the deployed copy of the backend from fleetguard-backend/,
+          #    which is the single source of truth. The copy committed inside
+          #    fleetguard-databricks-app/ is a snapshot for people deploying by
+          #    hand; this step is what keeps a push deploying the current code.
+          #
+          #    app/ and alembic/ are cleared first. Plain `cp -r` merges, so a
+          #    module deleted in the backend would otherwise survive in the
+          #    deployed tree and keep being imported.
+          rm -rf fleetguard-databricks-app/app fleetguard-databricks-app/alembic
+          cp -r fleetguard-backend/app     fleetguard-databricks-app/app
+          cp -r fleetguard-backend/alembic fleetguard-databricks-app/alembic
+          cp fleetguard-backend/alembic.ini fleetguard-databricks-app/alembic.ini
+
+          # scripts/ is merged rather than replaced: build_and_prepare.sh and
+          # .ps1 live there and have no counterpart in the backend.
+          cp -r fleetguard-backend/scripts/. fleetguard-databricks-app/scripts/
+
+          # requirements.txt is deliberately NOT copied. The deployed list is
+          # unpinned and drops the test-only packages; the backend's is pinned
+          # for local development and CI. See the note at the top of
+          # fleetguard-databricks-app/requirements.txt.
+
+          # 2. Build the frontend
+          cd fleetguard-frontend
+          npm install && npm run build
+
+          # 3. Replace the bundle. Vite hashes every filename, so copying over
+          #    the old one would accumulate the superseded chunks of every past
+          #    deploy instead of replacing them.
+          rm -rf ../fleetguard-databricks-app/static
+          mkdir -p ../fleetguard-databricks-app/static
+          cp -r dist/* ../fleetguard-databricks-app/static/
+      - uses: databricks/setup-cli@main
+      - env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          # 1. Sync the fresh code from GitHub into your personal workspace folder
+          databricks sync ./fleetguard-databricks-app /Workspace/Users/gauravb0520@gmail.com/fleetguard-databricks-app
+          
+          # 2. Deploy the app!
+          databricks apps deploy fleetguard-ai --source-code-path /Workspace/Users/gauravb0520@gmail.com/fleetguard-databricks-app

@@ -1,0 +1,2 @@
+import{n as a,B as i,X as s,Y as t,o as e}from"./Chart-C28rb_f7.js";var o=a({chartName:"BarChart",GraphicalChild:i,defaultTooltipEventType:"axis",validateTooltipEventTypes:["axis","item"],axisComponents:[{axisType:"xAxis",AxisComp:s},{axisType:"yAxis",AxisComp:t}],formatAxisMap:e});export{o as B};
+//# sourceMappingURL=BarChart-BHBR8J4Q.js.map

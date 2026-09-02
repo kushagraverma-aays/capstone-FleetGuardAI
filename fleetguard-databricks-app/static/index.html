@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="FleetGuard AI - predictive maintenance for commercial vehicle fleets."
+    />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <title>FleetGuard AI</title>
+    <script>
+      // Applied before first paint so a dark-mode reload never flashes white.
+      (function () {
+        try {
+          var stored = localStorage.getItem("fleetguard.theme");
+          var dark =
+            stored === "dark" ||
+            (stored !== "light" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (err) {
+          /* private mode: fall back to the light palette */
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-_jpWG9t2.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DPf2u1rB.css">
+  </head>
+  <body class="h-full">
+    <div id="root" class="h-full"></div>
+  </body>
+</html>

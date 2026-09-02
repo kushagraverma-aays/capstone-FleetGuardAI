@@ -1,0 +1,46 @@
+command:
+  - "python"
+  - "run.py"
+
+env:
+  - name: ENVIRONMENT
+    value: "production"
+
+  # ── Your MySQL details (plain text — not sensitive) ───
+  - name: MYSQL_HOST
+    value: "fleetguard-ai-server1.mysql.database.azure.com"
+  - name: MYSQL_PORT
+    value: "3306"
+  - name: MYSQL_USER
+    value: "gaurav"
+  - name: MYSQL_DB
+    value: "fleetguard"
+  # Azure Database for MySQL Flexible Server runs with require_secure_transport
+  # ON and refuses an unencrypted connection. This REPLACES the TLS flag that
+  # used to be hardcoded in app/db.py and alembic/env.py: it is now a setting,
+  # so the same code connects to a local MySQL without it. Leaving this out is
+  # the one change that will stop the deployed app reaching the database.
+  - name: MYSQL_SSL
+    value: "true"
+
+  # ── Secrets (pulled from Databricks Secrets) ─────────
+  - name: MYSQL_PASSWORD
+    valueFrom: "mysql_pswd"
+  - name: JWT_SECRET
+    valueFrom: "jwt_secret"
+  - name: LLM_API_KEY
+    valueFrom: "api_key"
+
+  # ── App config ───────────────────────────────────────
+  - name: AUTH_ENABLED
+    value: "false"
+  - name: LLM_BASE_URL
+    value: "https://api.groq.com/openai/v1"
+  - name: LLM_MODEL
+    value: "openai/gpt-oss-120b"
+  - name: CORS_ORIGINS
+    value: "*"
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: LOG_JSON
+    value: "true"
