@@ -2,6 +2,9 @@
 
 Predictive maintenance for commercial truck fleets.
 
+Built by **Parth Ratra**, **Kushagra Verma** and **Gaurav Bisht** as a capstone
+project for the analytics training programme at **AAYS Analytics**.
+
 Every modern truck already streams around two hundred sensor signals that
 contain early warning of component failure. FleetGuard AI turns *"the truck
 broke down"* into *"this component will likely fail in 17 days — order the part

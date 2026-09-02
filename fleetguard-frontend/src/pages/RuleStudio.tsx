@@ -19,6 +19,7 @@ import {
   ChevronLeft,
   ChevronRight,
   History,
+  RotateCcw,
   Rocket,
   Search,
   ShieldOff,
@@ -32,6 +33,7 @@ import {
   usePartCorrelations,
   usePartHistory,
   useParts,
+  useRestoreRule,
   useRule,
   useRuleHistory,
   useRulePreview,
@@ -894,7 +896,12 @@ function DeployStep({
               description="Deploying the rule above makes it version 1, and every later version is compared against it here."
             />
           ) : (
-            <RuleHistory versions={history.data ?? []} activeVersion={active.data?.version} />
+            <RuleHistory
+              partCode={partCode}
+              versions={history.data ?? []}
+              activeVersion={active.data?.version}
+              canManageRules={canManageRules}
+            />
           )}
         </CardBody>
       </Card>
@@ -903,15 +910,46 @@ function DeployStep({
 }
 
 function RuleHistory({
+  partCode,
   versions,
   activeVersion,
+  canManageRules,
 }: {
+  partCode: string;
   versions: RuleOut[];
   activeVersion?: number;
+  canManageRules: boolean;
 }) {
   const [compare, setCompare] = useState<number | null>(null);
+  const [restoring, setRestoring] = useState<RuleOut | null>(null);
+  const restore = useRestoreRule();
+  const toast = useToast();
   const activeRule = versions.find((rule) => rule.version === activeVersion) ?? versions[0];
   const comparing = versions.find((rule) => rule.version === compare);
+
+  const runRestore = () => {
+    if (!restoring) return;
+    const from = restoring.version;
+    restore.mutate(
+      { partCode, version: from },
+      {
+        onSuccess: (rule) => {
+          setRestoring(null);
+          // The new version number is the point: it is what tells the viewer
+          // this rolled forward rather than reactivating the old row.
+          toast.show({
+            tone: "success",
+            title: `v${from} restored as v${rule.version}`,
+            detail: `Re-tested against current data: ${formatPercent(rule.precision)} precision, ${formatPercent(rule.coverage)} coverage, ${Math.round(rule.days_to_alert)} days of warning.`,
+          });
+        },
+        onError: (error) => {
+          setRestoring(null);
+          toast.show({ tone: "error", title: "Restore refused", detail: error.message });
+        },
+      },
+    );
+  };
 
   return (
     <div className="space-y-3">
@@ -932,19 +970,61 @@ function RuleHistory({
               {rule.created_by} - {formatDate(rule.created_at)}
             </span>
             {rule.version !== activeRule?.version ? (
-              <button
-                type="button"
-                onClick={() => setCompare(compare === rule.version ? null : rule.version)}
-                className="ml-auto text-[0.75rem] text-accent transition-colors hover:text-accent-ink"
-              >
-                {compare === rule.version ? "Hide comparison" : `Compare with v${activeRule?.version}`}
-              </button>
+              <div className="ml-auto flex items-center gap-3.5">
+                <button
+                  type="button"
+                  onClick={() => setCompare(compare === rule.version ? null : rule.version)}
+                  className="text-[0.75rem] text-accent transition-colors hover:text-accent-ink"
+                >
+                  {compare === rule.version
+                    ? "Hide comparison"
+                    : `Compare with v${activeRule?.version}`}
+                </button>
+                {canManageRules ? (
+                  <button
+                    type="button"
+                    onClick={() => setRestoring(rule)}
+                    disabled={restore.isPending}
+                    className="inline-flex items-center gap-1 text-[0.75rem] text-muted transition-colors hover:text-ink disabled:opacity-50"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                    Restore
+                  </button>
+                ) : null}
+              </div>
             ) : null}
           </li>
         ))}
       </ul>
 
       {comparing && activeRule ? <RuleComparison a={comparing} b={activeRule} /> : null}
+
+      {/*
+        Worded as "roll forward", not "roll back", because that is what actually
+        happens - and because a viewer who expects v5 to disappear needs to be
+        told before they click, not after they see v6 appear.
+      */}
+      <ConfirmDialog
+        open={restoring !== null}
+        title={`Restore v${restoring?.version} as the active rule?`}
+        description={`This deploys v${restoring?.version}'s signals as a new version rather than reactivating the old row, so nothing in the history is overwritten. It is re-tested against current data first, so its metrics may differ from those recorded when it was first deployed.`}
+        confirmLabel="Restore this version"
+        loading={restore.isPending}
+        onCancel={() => setRestoring(null)}
+        onConfirm={runRestore}
+      >
+        {restoring ? (
+          <div className="rounded-card border border-hairline bg-canvas px-3.5 py-3">
+            <Formula formula={restoring.formula} />
+            <p className="mt-2 text-[0.75rem] text-muted">
+              Recorded when v{restoring.version} was deployed:{" "}
+              {formatPercent(restoring.precision)} precision,{" "}
+              {formatPercent(restoring.coverage)} coverage,{" "}
+              {Math.round(restoring.days_to_alert)} days of warning.
+            </p>
+          </div>
+        ) : null}
+      </ConfirmDialog>
     </div>
   );
 }

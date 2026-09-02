@@ -305,6 +305,114 @@ def test_unknown_signal_is_rejected_with_the_valid_list(client, any_prediction):
     assert "coolant_temp_variance" in response.json()["message"]
 
 
+# --- restoring an earlier rule version ---------------------------------------
+#
+# These write to the database on purpose - restoring is a deploy, and a test
+# that mocked the write would not prove the thing worth proving, which is that
+# the history survives it. `python -m scripts.manage rebuild` resets the extra
+# versions.
+
+
+def _deployed_versions(client, part_code: str) -> list[int]:
+    return [r["version"] for r in client.get(f"/api/rules/{part_code}/history").json()]
+
+
+def test_restore_rolls_forward_and_keeps_every_earlier_version(client, any_prediction):
+    """Restoring v_old must add a version, never resurrect or delete one."""
+    part = any_prediction.part_code
+    before = _deployed_versions(client, part)
+    active = next(r for r in client.get(f"/api/rules/{part}/history").json() if r["is_active"])
+    older = [v for v in before if v != active["version"]]
+    if not older:
+        # Give the part a second version so there is something to restore.
+        assert client.post("/api/rules", json={"part_code": part}).status_code == 201
+        before = _deployed_versions(client, part)
+        active = next(
+            r for r in client.get(f"/api/rules/{part}/history").json() if r["is_active"]
+        )
+        older = [v for v in before if v != active["version"]]
+
+    source_version = min(older)
+    source = next(
+        r for r in client.get(f"/api/rules/{part}/history").json()
+        if r["version"] == source_version
+    )
+
+    response = client.post(f"/api/rules/{part}/restore/{source_version}")
+    assert response.status_code == 201, response.text
+    restored = response.json()
+
+    # A new version on top, not the old row switched back on.
+    assert restored["version"] == max(before) + 1
+    assert restored["is_active"] is True
+
+    after = _deployed_versions(client, part)
+    assert set(before).issubset(set(after)), "restoring must not remove a version"
+    assert len(after) == len(before) + 1
+
+    # Exactly one active rule, and it is the new one.
+    history = client.get(f"/api/rules/{part}/history").json()
+    assert [r["version"] for r in history if r["is_active"]] == [restored["version"]]
+
+    # The signals are the ones the restored version carried.
+    def included(rule):
+        return sorted(s["signal"] for s in rule["signals"] if s["included"])
+
+    assert included(restored) == included(source)
+
+
+def test_restoring_the_active_version_is_a_conflict(client, any_prediction):
+    part = any_prediction.part_code
+    active = next(r for r in client.get(f"/api/rules/{part}/history").json() if r["is_active"])
+    response = client.post(f"/api/rules/{part}/restore/{active['version']}")
+    assert response.status_code == 409
+    assert response.json()["error"] == "conflict"
+
+
+def test_restoring_a_version_that_never_existed_lists_the_ones_that_do(client, any_prediction):
+    part = any_prediction.part_code
+    response = client.post(f"/api/rules/{part}/restore/9999")
+    assert response.status_code == 404
+    message = response.json()["message"]
+    assert "9999" in message
+    # The 404 must name the real options rather than leaving the caller guessing.
+    assert "v1" in message
+
+
+def test_restore_is_manufacturer_only(client, any_prediction, as_customer):
+    response = client.post(
+        f"/api/rules/{any_prediction.part_code}/restore/1", headers=as_customer
+    )
+    assert response.status_code == 403
+
+
+def test_restore_writes_an_audit_row_carrying_both_sets_of_metrics(client, db, reread,
+                                                                   any_prediction):
+    part = any_prediction.part_code
+    active = next(r for r in client.get(f"/api/rules/{part}/history").json() if r["is_active"])
+    older = [
+        r["version"] for r in client.get(f"/api/rules/{part}/history").json()
+        if r["version"] != active["version"]
+    ]
+    if not older:
+        pytest.skip("Needs a second version to restore.")
+
+    response = client.post(f"/api/rules/{part}/restore/{min(older)}")
+    assert response.status_code == 201
+    rule_id = response.json()["rule_id"]
+
+    session = reread()
+    entry = session.execute(
+        select(AuditLog)
+        .where(AuditLog.action == "rule.restore", AuditLog.entity_id == str(rule_id))
+    ).scalars().first()
+    assert entry is not None
+    assert entry.payload["restored_from_version"] == min(older)
+    # Both sets are kept so re-scoring against current data is visible, not hidden.
+    assert "source_metrics" in entry.payload
+    assert "restored_metrics" in entry.payload
+
+
 # --- overview and analytics --------------------------------------------------
 
 

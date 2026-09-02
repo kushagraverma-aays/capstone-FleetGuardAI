@@ -206,6 +206,62 @@ def deploy_rule(
     return RuleOut(**fleet_queries.rule_to_dict(db, rule, part.part_name))
 
 
+@router.post(
+    "/rules/{part_code}/restore/{version}",
+    response_model=RuleOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Redeploy an earlier version's signals as a new version",
+)
+def restore_rule(
+    part_code: str, version: int, db: DbSession, scope: RuleAuthorScope
+) -> RuleOut:
+    """Roll back to an earlier rule, forwards.
+
+    Restoring v2 while v5 is live writes v6 carrying v2's signals. Nothing is
+    reactivated and nothing is deleted, so the history still reads as the
+    sequence of decisions that were actually taken - which is the property the
+    audit log exists to preserve.
+
+    The restored version is re-scored against **current** data, so its metrics
+    can differ from those stored on the version being restored. Both sets are
+    written to the audit entry so the difference is visible rather than
+    surprising.
+    """
+    part = _require_part(db, part_code)
+
+    features = feature_cache.features_for_part(db, part_code)
+    failures = feature_cache.failures_for_part(db, part_code)
+
+    try:
+        rule, _source = rules_engine.restore_rule(
+            db,
+            features,
+            failures,
+            part_code,
+            version,
+            created_by=scope.email or "manufacturer",
+            user_id=scope.user_id,
+        )
+    except LookupError as exc:
+        # Name the versions that do exist - a 404 saying only "not found" leaves
+        # the caller guessing whether they used the wrong part or the wrong number.
+        available = [r.version for r in rules_engine.rule_history(db, part_code)]
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"{exc} Deployed versions for {part.part_name} are: "
+                + (", ".join(f"v{v}" for v in available) if available else "none")
+                + "."
+            ),
+        ) from exc
+    except ValueError as exc:
+        # Already active, or nothing to restore. Both are the caller asking for
+        # a state the system is already in or cannot represent - a 409, not a 500.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    return RuleOut(**fleet_queries.rule_to_dict(db, rule, part.part_name))
+
+
 @router.get(
     "/rules",
     response_model=list[RuleOut],

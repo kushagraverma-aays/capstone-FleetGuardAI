@@ -222,6 +222,80 @@ def deploy_rule(
     return rule
 
 
+def restore_rule(
+    session: Session,
+    features: pd.DataFrame,
+    failures: pd.DataFrame,
+    part_code: str,
+    version: int,
+    created_by: str = "system",
+    user_id: int | None = None,
+) -> tuple[Rule, Rule]:
+    """Redeploy an earlier version's signal selection as a new version.
+
+    Rolling back forwards, deliberately. The old row is never reactivated and
+    nothing is deleted: restoring v2 while v5 is live produces v6 carrying v2's
+    signals, so the history still reads as the sequence of decisions that were
+    actually made.
+
+    The consequence worth knowing is that the restored version is **re-scored
+    against today's data**, so its precision may not match the number stored on
+    the version being restored. That is the honest answer rather than a defect
+    - what a user needs to know is how the old rule performs now, not how it
+    performed against the fleet as it stood when it was first deployed.
+
+    Returns (new_rule, source_rule).
+    """
+    source = session.execute(
+        select(Rule).where(Rule.part_code == part_code, Rule.version == version)
+    ).scalars().first()
+    if source is None:
+        raise LookupError(f"No version {version} of the rule for {part_code}.")
+    if source.is_active:
+        raise ValueError(f"Version {version} is already the active rule for {part_code}.")
+
+    signals = list(rule_weights(session, source))
+    if not signals:
+        raise ValueError(
+            f"Version {version} has no included signals, so there is nothing to restore."
+        )
+
+    rule = deploy_rule(
+        session, features, failures, part_code, signals,
+        created_by=created_by, user_id=user_id,
+    )
+
+    session.add(
+        AuditLog(
+            user_id=user_id,
+            action="rule.restore",
+            entity="rule",
+            entity_id=str(rule.rule_id),
+            payload={
+                "part_code": part_code,
+                "restored_from_version": source.version,
+                "restored_from_rule_id": source.rule_id,
+                "new_version": rule.version,
+                "signals": signals,
+                # Kept so a reviewer can see whether re-scoring against current
+                # data moved the metrics, and by how much.
+                "source_metrics": {
+                    "precision": source.precision,
+                    "coverage": source.coverage,
+                    "days_to_alert": source.days_to_alert,
+                },
+                "restored_metrics": {
+                    "precision": rule.precision,
+                    "coverage": rule.coverage,
+                    "days_to_alert": rule.days_to_alert,
+                },
+            },
+        )
+    )
+    session.commit()
+    return rule, source
+
+
 def load_failures(session: Session) -> pd.DataFrame:
     """Failure events only - the ground truth the back-test scores against."""
     frame = pd.DataFrame(
