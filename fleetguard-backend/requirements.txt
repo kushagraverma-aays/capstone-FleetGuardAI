@@ -21,8 +21,10 @@ scipy==1.15.0
 scikit-learn==1.6.0
 
 # --- auth ---
-passlib==1.7.4
-bcrypt==4.0.1
+# bcrypt is used directly, without passlib: passlib 1.7.4 probes
+# bcrypt.__about__.__version__ at import time and that attribute is gone from
+# bcrypt 4.1 onward, so the two no longer work together.
+bcrypt==4.2.1
 PyJWT==2.10.1
 
 # --- llm (OpenAI-compatible client pointed at Groq) ---

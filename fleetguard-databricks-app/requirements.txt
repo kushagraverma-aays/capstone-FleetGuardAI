@@ -1,0 +1,42 @@
+# Deliberately unpinned, matching what the working Databricks deployment
+# already installs. fleetguard-backend/requirements.txt pins the same set for
+# local development and CI; if a deploy ever installs a version that breaks,
+# copy the pins across rather than debugging a moving target.
+
+# ── Web Framework ───────────────────────────────────────────
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+
+# ── Database ────────────────────────────────────────────────
+SQLAlchemy
+PyMySQL
+cryptography
+alembic
+
+# ── Config / Validation ────────────────────────────────────
+pydantic
+pydantic-settings
+python-dotenv
+
+# ── Analytics / ML ─────────────────────────────────────────
+pandas
+numpy
+scipy
+scikit-learn
+
+# ── Auth ────────────────────────────────────────────────────
+# passlib is gone on purpose. It reads bcrypt.__about__.__version__ at import
+# time to detect its backend, and that attribute was removed in bcrypt 4.1, so
+# an unpinned install of the two together fails. app/security.py now calls
+# bcrypt directly.
+bcrypt
+PyJWT
+
+# ── LLM (OpenAI-compatible → Groq) ────────────────────────
+openai
+
+# ── Ops ─────────────────────────────────────────────────────
+python-json-logger
+slowapi

@@ -439,6 +439,27 @@ export function useDeployRule() {
   });
 }
 
+/**
+ * Restore an earlier rule version.
+ *
+ * Same cache consequence as a deploy - it writes a new active version - so it
+ * invalidates the whole scope rather than just the rule keys.
+ */
+export function useRestoreRule() {
+  const scope = useScope();
+  const queryClient = useQueryClient();
+  return useMutation<
+    Awaited<ReturnType<typeof api.restoreRule>>,
+    ApiError,
+    { partCode: string; version: number }
+  >({
+    mutationFn: ({ partCode, version }) => api.restoreRule(partCode, version),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.root(scope) });
+    },
+  });
+}
+
 // --- assistant ---------------------------------------------------------------
 
 export function useChatCapabilities() {

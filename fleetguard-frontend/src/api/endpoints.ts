@@ -194,6 +194,14 @@ export const previewRule = (payload: RulePreviewRequest) =>
 export const deployRule = (payload: RuleDeployRequest) =>
   request<RuleOut>("/api/rules", { method: "POST", body: payload });
 
+/** Redeploys an older version's signals as a new version. Rolling back forwards:
+ *  nothing is reactivated, so the history stays a record of what was decided. */
+export const restoreRule = (partCode: string, version: number) =>
+  request<RuleOut>(
+    `/api/rules/${encodeURIComponent(partCode)}/restore/${version}`,
+    { method: "POST" },
+  );
+
 // --- analytics ---------------------------------------------------------------
 
 export const getCostExposure = (dimension: "customer" | "component" | "region") =>
