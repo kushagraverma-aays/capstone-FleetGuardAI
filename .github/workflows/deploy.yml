@@ -21,20 +21,11 @@ jobs:
           # 3. Copy built frontend into the static folder
           cp -r dist/* ../fleetguard-databricks-app/static/
       - uses: databricks/setup-cli@main
-      - env:
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-        run: |
-          # 1. Sync the fresh code from GitHub into your personal workspace folder
-          databricks sync ./fleetguard-databricks-app /Workspace/Users/gauravb0520@gmail.com/fleetguard-databricks-app
-          
-          # 2. Deploy the app to Databricks!
-          databricks apps deploy fleetguard-ai --source-code-path /Workspace/Users/gauravb0520@gmail.com/fleetguard-databricks-app
 
       # ── Deploy to Azure App Service (Public Client Website) ─────────────────
       - name: Deploy to Azure App Service
         uses: azure/webapps-deploy@v2
         with:
-          app-name: 'fleetguard-ai'
+          app-name: 'fleetguard-app'
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: './fleetguard-databricks-app'
